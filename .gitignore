@@ -23,6 +23,7 @@ env/
 *~
 
 # Local agent tooling
+.rea-workbench/
 .codex/
 .devin/
 .factory/

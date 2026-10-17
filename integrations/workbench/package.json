@@ -1,0 +1,23 @@
+{
+  "name": "rea-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Persistent investigation workflows for the published REA CLI and MCP server.",
+  "type": "module",
+  "engines": {
+    "node": "^24.11.0 || >=26.0.0"
+  },
+  "scripts": {
+    "rea": "rea",
+    "rea:mcp": "rea mcp",
+    "workbench": "node bin/workbench.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:integration": "node --test test/*.integration.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/server": "2.3.1",
+    "rea-agents": "6.5.0",
+    "zod": "4.4.3"
+  }
+}

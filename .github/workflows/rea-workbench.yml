@@ -1,0 +1,39 @@
+name: REA workbench
+
+on:
+  pull_request:
+    paths:
+      - "integrations/workbench/**"
+      - ".github/workflows/rea-workbench.yml"
+      - ".gitignore"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workbench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: integrations/workbench
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.18.0"
+          cache: npm
+          cache-dependency-path: integrations/workbench/package-lock.json
+      - name: Use repository npm version
+        run: npm install --global npm@11.16.0 --ignore-scripts --no-fund --no-audit
+      - name: Install pinned workbench dependencies
+        run: npm ci --ignore-scripts --omit=optional --no-fund --no-audit
+      - name: Focused checks
+        run: npm test
+      - name: Published-package CLI workflows
+        run: npm run test:integration
+      - name: Inspect private package contents
+        run: npm pack --dry-run --ignore-scripts
