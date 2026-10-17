@@ -1,6 +1,14 @@
 import * as t from "@babel/types";
 import type { JavaScriptSemanticPrimitive } from "./javascriptSemanticValueTypes.js";
 
+/** TypeScript receiver annotations occupy no positional runtime parameter slot. */
+export const runtimeFunctionParameters = (
+  node: t.Function,
+): t.Function["params"] =>
+  t.isIdentifier(node.params[0], { name: "this" })
+    ? node.params.slice(1)
+    : node.params;
+
 /**
  * Remove wrappers that affect TypeScript or Flow checking but not runtime
  * expression identity. The returned depth lets bounded evaluators account for
@@ -73,6 +81,20 @@ export const semanticStaticPropertyKey = (
   property = unwrapJavaScriptExpression(property).node;
   if (t.isStringLiteral(property) || t.isNumericLiteral(property))
     return String(property.value);
+  if (t.isBigIntLiteral(property)) return String(property.value);
+  if (
+    t.isUnaryExpression(property, { operator: "-" }) &&
+    t.isBigIntLiteral(property.argument)
+  )
+    return String(-BigInt(property.argument.value));
+  if (
+    t.isTemplateLiteral(property) &&
+    property.expressions.length === 0 &&
+    property.quasis.length === 1
+  ) {
+    const cooked = property.quasis[0]?.value.cooked;
+    return cooked === null || cooked === undefined ? null : cooked;
+  }
   return !computed && t.isIdentifier(property) ? property.name : null;
 };
 
@@ -85,6 +107,41 @@ export const semanticObjectPatternKeys = (
     const key = semanticStaticPropertyKey(property.key, property.computed);
     return key === null ? [] : [key];
   });
+
+/** Return the syntactic node whose target this construct writes. */
+export const semanticWriteSiteTarget = (node: t.Node): t.Node | null => {
+  if (t.isAssignmentExpression(node)) return node.left;
+  if (t.isUpdateExpression(node)) return node.argument;
+  if (t.isUnaryExpression(node, { operator: "delete" })) return node.argument;
+  if (t.isForOfStatement(node) || t.isForInStatement(node)) return node.left;
+  return null;
+};
+
+/** Whether a write site reads the previous target value before writing. */
+export const semanticWriteSiteReadsFirst = (site: t.Node): boolean =>
+  (t.isAssignmentExpression(site) && site.operator !== "=") ||
+  t.isUpdateExpression(site);
+
+/** Find the owning write site through inert TypeScript and parenthesis wrappers. */
+export const semanticWrappedWriteSite = (
+  node: t.Node,
+  parent: t.Node,
+  ancestors: readonly t.Node[],
+): t.Node | null => {
+  const chain =
+    ancestors.at(-1) === parent ? ancestors : [...ancestors, parent];
+  for (let index = chain.length - 1; index >= 0; index -= 1) {
+    const candidate = chain[index];
+    if (candidate === undefined) return null;
+    const target = semanticWriteSiteTarget(candidate);
+    if (target !== null)
+      return unwrapJavaScriptExpression(target).node === node
+        ? candidate
+        : null;
+    if (unwrapJavaScriptExpression(candidate).depth === 0) return null;
+  }
+  return null;
+};
 
 /** Visit binding and member leaves in direct and destructuring write targets. */
 export function* semanticWriteTargets(

@@ -1,3 +1,6 @@
+import { HOPPER_PUBLISHER } from "../domain/hopperPublisher.js";
+import type { LinuxPackageInstallFailure } from "./LinuxHopper.js";
+
 export type SetupFailureCode =
   | "unsupported_host"
   | "download_failed"
@@ -10,6 +13,7 @@ export type SetupFailureCode =
   | "destination_exists"
   | "mount_failed"
   | "bundle_invalid"
+  | "publisher_verification_failed"
   | "copy_failed"
   | "skill_install_failed"
   | "cleanup_failed";
@@ -39,11 +43,56 @@ export type HopperInstallFailureReason =
   | "destination_exists"
   | "mount"
   | "bundle"
+  | "publisher_verification_failed"
   | "copy";
+
+const normalizePackageOutput = (output: string): string =>
+  output
+    .replace(/\u001b(?:\[[0-9;?]*[ -/]*[@-~]|\([0-9A-Za-z]|[@-Z\\^_])/gu, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+
+const packageOutputExcerpt = (
+  failure: LinuxPackageInstallFailure,
+  limit = 400,
+): string => {
+  const output = [failure.stderr, failure.stdout]
+    .map(normalizePackageOutput)
+    .filter((text) => text !== "")
+    .join(" ");
+  const suffix = failure.outputTruncated ? " (output truncated)" : "";
+  const bodyLimit = limit - suffix.length;
+  if (output.length <= bodyLimit) return `${output}${suffix}`;
+  const half = Math.floor((bodyLimit - 3) / 2);
+  const head = output
+    .slice(0, half)
+    .replace(/\s+\S*$/u, "")
+    .trimEnd();
+  const tail = output
+    .slice(-half)
+    .replace(/^\S*\s+/u, "")
+    .trimStart();
+  return `${head} … ${tail}${suffix}`;
+};
+
+const packageManagerRemediation = (
+  failure: LinuxPackageInstallFailure | undefined,
+): string => {
+  if (failure === undefined)
+    return "Allow the system package-manager operation or install the planned Hopper package and Linux runtime dependencies, then rerun rea setup.";
+  const status =
+    failure.exitCode === null ? "no exit status" : `exit ${failure.exitCode}`;
+  const excerpt = packageOutputExcerpt(failure);
+  const observed =
+    excerpt === "" ? "no output was captured." : `its output: ${excerpt}`;
+  return `The system package-manager command failed (${failure.command}; ${status}); ${observed} Resolve the reported problem, grant the authorization the command needs, or install the planned Hopper package and Linux runtime dependencies manually, then rerun rea setup.`;
+};
 
 /** Map provider installer failures to stable setup codes and safe recovery. */
 export const setupInstallFailure = (
   reason: HopperInstallFailureReason,
+  packageFailure?: LinuxPackageInstallFailure,
 ): SetupHopperInstallResult => {
   switch (reason) {
     case "unsupported_host":
@@ -63,8 +112,7 @@ export const setupInstallFailure = (
       return {
         status: "failed",
         code: "authorization_or_package_manager_failed",
-        remediation:
-          "Allow the system package-manager operation or install the planned Hopper package and Linux runtime dependencies, then rerun rea setup.",
+        remediation: packageManagerRemediation(packageFailure),
       };
     case "launcher_missing":
       return {
@@ -114,6 +162,12 @@ export const setupInstallFailure = (
         code: "bundle_invalid",
         remediation:
           "The mounted package did not contain the expected Hopper application bundle. Retry setup; if it repeats, update REA before installing.",
+      };
+    case "publisher_verification_failed":
+      return {
+        status: "failed",
+        code: "publisher_verification_failed",
+        remediation: `The mounted Hopper application is not signed by the publisher REA pins (${HOPPER_PUBLISHER.bundleIdentifier}, Apple team ${HOPPER_PUBLISHER.teamIdentifier}); nothing was copied or launched. Install Hopper yourself and set HOPPER_LAUNCHER_PATH to its launcher, then rerun rea setup.`,
       };
     case "copy":
       return {

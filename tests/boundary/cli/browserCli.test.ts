@@ -93,7 +93,7 @@ it(
     const compared = await runCli(
       [
         "compare-web-captures",
-        JSON.stringify({ inspection }),
+        JSON.stringify({ inspection, scenario: { caller_metadata: true } }),
         JSON.stringify({ inspection }),
         "--json",
       ],
@@ -183,6 +183,274 @@ it(
   INTEGRATION_TEST_TIMEOUT_MS,
 );
 
+it(
+  "compares redirect metadata uncertainty through the public CLI",
+  async () => {
+    const browser = await startFakeCdpBrowser();
+    browsers.push(browser);
+    const inspected = await runCli(
+      [
+        "inspect-web-page",
+        browser.endpoint,
+        "allowed-page",
+        "--observation-ms",
+        "0",
+        "--json",
+      ],
+      process.env,
+    );
+    const inspection = normalizedResult(inspected);
+    const missingVsKnown = await compareCapturesCli(
+      redirectCapture(inspection, browser.allowedOrigin, null),
+      redirectCapture(inspection, browser.allowedOrigin, 302),
+    );
+    expect(missingVsKnown).toMatchObject({
+      normalized_result: {
+        dimensions: {
+          network: {
+            status: "unknown",
+            total_changes: 0,
+            reason: expect.stringContaining("redirect"),
+          },
+        },
+      },
+    });
+    const knownDifference = await compareCapturesCli(
+      redirectCapture(inspection, browser.allowedOrigin, 302),
+      redirectCapture(inspection, browser.allowedOrigin, 307),
+    );
+    expect(knownDifference).toMatchObject({
+      normalized_result: {
+        dimensions: { network: { status: "changed", total_changes: 1 } },
+      },
+    });
+  },
+  INTEGRATION_TEST_TIMEOUT_MS,
+);
+
+it(
+  "browser CLI attaches through a browser socket and records it redacted",
+  async () => {
+    const browser = await startFakeCdpBrowser();
+    browsers.push(browser);
+    const inspected = await runCli(
+      [
+        "inspect-web-page",
+        browser.browserWebSocketUrl,
+        "allowed-page",
+        "--observation-ms",
+        "0",
+        "--json",
+      ],
+      process.env,
+    );
+    expect(inspected).toMatchObject({
+      operation: "inspect_web_page",
+      parameters: {
+        cdp_endpoint: browser.browserWebSocketUrl.replace(
+          /fake$/u,
+          "[REDACTED]",
+        ),
+      },
+      normalized_result: { target: { target_id: "allowed-page" } },
+    });
+    expect(JSON.stringify(inspected)).not.toContain("/devtools/browser/fake");
+
+    const refused = await runCli(
+      [
+        "list-browser-targets",
+        browser.browserWebSocketUrl.replace(/fake$/u, "not-this-browser"),
+        "--json",
+      ],
+      process.env,
+    );
+    expect(refused).toMatchObject({
+      code: "provider_unavailable",
+      details: {
+        operation: "list_browser_targets",
+        reason: "endpoint_unreachable",
+      },
+    });
+    expect(JSON.stringify(refused)).not.toContain("not-this-browser");
+  },
+  INTEGRATION_TEST_TIMEOUT_MS,
+);
+
+describe("scenario comparison CLI diagnostics", () => {
+  const rule = {
+    rule_id: "domain",
+    artifacts: ["url"],
+    match: "app.example.test",
+    replacement: "normalized.test",
+  };
+  it.each([
+    {
+      name: "duplicate rule IDs",
+      normalization: { rules: [rule, rule] },
+      issue: {
+        path: ["normalization", "rules", 1, "rule_id"],
+        reason: "invalid_value",
+        message: "Normalization rule IDs must be unique",
+      },
+    },
+    {
+      name: "duplicate artifact kinds",
+      normalization: { rules: [{ ...rule, artifacts: ["url", "url"] }] },
+      issue: {
+        path: ["normalization", "rules", 0, "artifacts"],
+        reason: "invalid_value",
+        message: "Normalization rule artifact kinds must be unique",
+      },
+    },
+    {
+      name: "structurally invalid rules",
+      normalization: { rules: "invalid" },
+      issue: {
+        path: ["normalization", "rules"],
+        reason: "invalid_type",
+        expected: "array",
+      },
+    },
+  ])(
+    "retains scenario normalization diagnostics for $name",
+    async ({ normalization, issue }) => {
+      const capture = JSON.stringify(completeScenarioCapture());
+      const result = await runCli([
+        "compare-web-captures",
+        capture,
+        capture,
+        "--normalization-json",
+        JSON.stringify(normalization),
+        "--json",
+      ]);
+      expect(result).toMatchObject({
+        code: "invalid_request",
+        details: { operation: "compare_web_captures", issues: [issue] },
+      });
+    },
+  );
+
+  it("keeps malformed scenario diagnostics in the selected capture group", async () => {
+    const capture = completeScenarioCapture();
+    const result = await runCli([
+      "compare-web-captures",
+      JSON.stringify({ ...capture, duration_ms: "invalid" }),
+      JSON.stringify(capture),
+      "--json",
+    ]);
+    expect(result).toMatchObject({
+      code: "invalid_request",
+      details: {
+        operation: "compare_web_captures",
+        issues: [
+          {
+            path: ["before_scenario", "duration_ms"],
+            reason: "invalid_type",
+            expected: "number",
+          },
+        ],
+      },
+    });
+  });
+
+  it.each(["omitted", "misspelled"])(
+    "reports the missing scenario manifest when it is %s on both captures",
+    async (kind) => {
+      const { scenario, ...capture } = completeScenarioCapture();
+      const input = JSON.stringify(
+        kind === "omitted" ? capture : { ...capture, scneario: scenario },
+      );
+      const result = await runCli([
+        "compare-web-captures",
+        input,
+        input,
+        "--json",
+      ]);
+      expect(result).toMatchObject({
+        code: "invalid_request",
+        details: {
+          operation: "compare_web_captures",
+          issues: expect.arrayContaining([
+            {
+              path: ["before_scenario", "scenario"],
+              reason: "missing_argument",
+              expected: "object",
+            },
+            {
+              path: ["after_scenario", "scenario"],
+              reason: "missing_argument",
+              expected: "object",
+            },
+          ]),
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain('"inspection"');
+    },
+  );
+});
+
+describe("scenario comparison recovery guidance", () => {
+  it("reports independent network recovery alongside console differences", async () => {
+    const base = completeScenarioCapture();
+    const matchingSelection = scenarioCaptureWithConsole(
+      "before",
+      base.scenario.network_content,
+    );
+    const differentSelection = scenarioCaptureWithConsole("after", {
+      ...base.scenario.network_content,
+      response_body: true,
+    });
+    const changed = await compareCapturesCli(
+      matchingSelection,
+      differentSelection,
+    );
+    expect(changed).toMatchObject({
+      normalized_result: {
+        overall_status: "changed",
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            step_id: "open-settings",
+            artifact_diffs: expect.arrayContaining([
+              expect.objectContaining({
+                artifact: "events",
+                status: "changed",
+                reason: expect.stringContaining(
+                  "Network content selections differ",
+                ),
+              }),
+            ]),
+          }),
+        ]),
+      },
+    });
+    const quietMismatch = await compareCapturesCli(
+      matchingSelection,
+      scenarioCaptureWithConsole(
+        "before",
+        differentSelection.scenario.network_content,
+      ),
+    );
+    expect(quietMismatch).toMatchObject({
+      normalized_result: {
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            step_id: "open-settings",
+            artifact_diffs: expect.arrayContaining([
+              expect.objectContaining({
+                artifact: "events",
+                status: "unknown",
+                reason: expect.stringContaining(
+                  "Network content selections differ",
+                ),
+              }),
+            ]),
+          }),
+        ]),
+      },
+    });
+  });
+});
+
 describe("browser CLI capture parity", () => {
   it(
     "runs analysis, session, WebMCP, screenshot, and comparison from explicit request scope",
@@ -250,7 +518,14 @@ describe("browser CLI capture parity", () => {
         operation: "discover_webmcp_tools",
         normalized_result: {
           tools: {
-            items: [expect.objectContaining({ name: "search_orders" })],
+            items: [
+              expect.objectContaining({
+                name: "search_orders",
+                annotations: expect.objectContaining({
+                  consequential: true,
+                }),
+              }),
+            ],
           },
         },
       });
@@ -299,6 +574,43 @@ const normalizedResult = (value: unknown): Record<string, unknown> => {
     throw new TypeError("Missing CLI normalized result");
   return value.normalized_result;
 };
+
+const redirectCapture = (
+  inspection: Record<string, unknown>,
+  origin: string,
+  status: number | null,
+) => {
+  const copy = structuredClone(inspection);
+  if (!isRecord(copy.network) || !Array.isArray(copy.network.requests))
+    throw new Error("Missing network capture");
+  const request = copy.network.requests[0];
+  if (!isRecord(request)) throw new Error("Missing network request");
+  request.redirects = [
+    {
+      url: `${origin}/prior`,
+      response_url: `${origin}/prior`,
+      method: "GET",
+      resource_type: "Fetch",
+      status,
+      mime_type: "text/plain",
+      encoded_data_length: 12,
+      request_timestamp: 1,
+      redirect_event_timestamp: 2,
+    },
+  ];
+  return { inspection: copy };
+};
+
+const compareCapturesCli = (before: unknown, after: unknown) =>
+  runCli(
+    [
+      "compare-web-captures",
+      JSON.stringify(before),
+      JSON.stringify(after),
+      "--json",
+    ],
+    process.env,
+  );
 
 const completeScenarioCapture = () => {
   const url = {
@@ -352,6 +664,7 @@ const completeScenarioCapture = () => {
         response_body: false,
         header_values: false,
       },
+      event_families: [],
     },
     duration_ms: 1,
     steps: [
@@ -361,6 +674,39 @@ const completeScenarioCapture = () => {
     events: { retained: 0, dropped: 0, items: [] },
     completeness,
     limitations: [],
+  };
+};
+
+const scenarioCaptureWithConsole = (
+  text: string,
+  networkContent: {
+    readonly request_body: boolean;
+    readonly response_body: boolean;
+    readonly header_values: boolean;
+  },
+) => {
+  const capture = completeScenarioCapture();
+  return {
+    ...capture,
+    scenario: {
+      ...capture.scenario,
+      network_content: networkContent,
+      event_families: ["console"],
+    },
+    events: {
+      retained: 1,
+      dropped: 0,
+      items: [
+        {
+          sequence: 1,
+          step_index: 1,
+          kind: "console",
+          level: "info",
+          text,
+          url: null,
+        },
+      ],
+    },
   };
 };
 

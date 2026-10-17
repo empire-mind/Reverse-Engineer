@@ -2,13 +2,15 @@ import { randomUUID, createHash } from "node:crypto";
 import { access, realpath, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import type {
-  AnalysisExecution,
-  ExecutionOptions,
-} from "../application/AnalysisProvider.js";
+import type { ExecutionOptions } from "../application/AnalysisProvider.js";
 import { createAnalysisExecution } from "../application/AnalysisProvider.js";
-import type { WasmArtifactPort } from "../application/wasm/WasmArtifactPort.js";
+import type {
+  WasmArtifactExecution,
+  WasmArtifactPort,
+} from "../application/wasm/WasmArtifactPort.js";
 import { readStableArtifact } from "../artifacts/readStableArtifact.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import type {
   AnalysisError,
   AnalysisCapturedOutput,
@@ -16,6 +18,7 @@ import type {
 import {
   AnalysisCancelledError,
   AnalysisArtifactChangedError,
+  AnalysisCapabilityUnavailableError,
   AnalysisInputError,
   AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
@@ -41,9 +44,7 @@ const digest = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 /** Run caller-supplied WABT against private copies of exactly selected bytes. */
 export class WabtArtifactProvider implements WasmArtifactPort {
-  readonly #pendingRoots = new Set<
-    Pick<PrivateRuntimeRoot, "path" | "close">
-  >();
+  readonly #resources = new ArtifactResourceScope();
   constructor(
     readonly environment: Readonly<NodeJS.ProcessEnv> = process.env,
     readonly launcher?: Launcher,
@@ -53,37 +54,58 @@ export class WabtArtifactProvider implements WasmArtifactPort {
   ) {}
   /** Retry retained cleanup without discarding roots that still cannot be removed. */
   async close(): Promise<void> {
-    const failures: { path: string; reason: string }[] = [];
-    for (const root of this.#pendingRoots) {
-      try {
-        await root.close();
-        this.#pendingRoots.delete(root);
-      } catch (cause: unknown) {
-        failures.push({
-          path: root.path,
-          reason: cause instanceof Error ? cause.message : String(cause),
-        });
-      }
-    }
-    if (failures.length > 0)
+    try {
+      await this.#resources.close();
+    } catch (cause: unknown) {
+      const cleanup =
+        cause instanceof ArtifactReaderFailure ? cause.cleanup : undefined;
       throw new ProviderCleanupError(
         WABT_PROVIDER_IDENTITY.id,
-        failures.map(({ path }) => path),
-        { failures },
-        { operation: OPERATION },
+        cleanup?.resources ?? ["artifact-resources"],
+        {
+          reason:
+            cleanup?.reason ??
+            (cause instanceof Error ? cause.message : String(cause)),
+        },
+        { operation: OPERATION, cause },
       );
+    }
   }
   async inspect(
     input: InspectWasmArtifactInput,
     options?: ExecutionOptions,
-  ): Promise<Result<AnalysisExecution, AnalysisError>> {
+  ): Promise<Result<WasmArtifactExecution, AnalysisError>> {
+    try {
+      return await this.#resources.run(() => this.#inspect(input, options));
+    } catch (cause: unknown) {
+      if (
+        cause instanceof ArtifactReaderFailure &&
+        cause.reason === "unavailable" &&
+        cause.cleanup === undefined
+      )
+        return err(this.#closedError());
+      return err(wabtFailure(cause, "artifact", input.path));
+    }
+  }
+
+  #closedError(): AnalysisCapabilityUnavailableError {
+    return new AnalysisCapabilityUnavailableError(
+      WABT_PROVIDER_IDENTITY.id,
+      OPERATION,
+      "Provider is closing",
+    );
+  }
+
+  async #inspect(
+    input: InspectWasmArtifactInput,
+    options?: ExecutionOptions,
+  ): Promise<Result<WasmArtifactExecution, AnalysisError>> {
     let root: Pick<PrivateRuntimeRoot, "path" | "close"> | undefined;
     let phase: "configuration" | "artifact" | "producer" = "configuration";
-    let result: Result<AnalysisExecution, AnalysisError>;
+    let result: Result<WasmArtifactExecution, AnalysisError>;
     let capturedOutput: AnalysisCapturedOutput | undefined;
     try {
       if (options?.signal?.aborted) throw new AnalysisCancelledError(OPERATION);
-      await this.close();
       const directory = this.environment.REA_WABT_BIN_DIRECTORY ?? "";
       if (!isAbsolute(directory))
         throw new Error(
@@ -108,6 +130,8 @@ export class WabtArtifactProvider implements WasmArtifactPort {
           path,
           WABT_LIMITS.toolBytes,
           options?.signal,
+          undefined,
+          this.#resources,
         );
         commands.push({
           tool,
@@ -130,17 +154,24 @@ export class WabtArtifactProvider implements WasmArtifactPort {
             snapshotPath,
             WABT_LIMITS.inputBytes,
             options?.signal,
+            undefined,
+            this.#resources,
           );
           if (bytes.sha256 !== snapshotHash)
             throw new Error("Private WASM snapshot bytes changed.");
         } catch (cause: unknown) {
+          const cleanup =
+            cause instanceof ArtifactReaderFailure ? cause.cleanup : undefined;
           if (options?.signal?.aborted)
-            throw new AnalysisCancelledError(OPERATION);
+            throw new AnalysisCancelledError(OPERATION, {
+              cause,
+              ...(cleanup === undefined ? {} : { cleanup }),
+            });
           throw new AnalysisArtifactChangedError(
             OPERATION,
             input.path,
             "Private WASM snapshot no longer matches selected byte identity.",
-            { cause },
+            { cause, ...(cleanup === undefined ? {} : { cleanup }) },
           );
         }
       };
@@ -149,6 +180,7 @@ export class WabtArtifactProvider implements WasmArtifactPort {
         args: readonly string[],
         acceptNonZeroExit = false,
       ) => {
+        capturedOutput = undefined;
         await verifySnapshot();
         const snapshot = await runOwnedCommand(
           {
@@ -175,6 +207,8 @@ export class WabtArtifactProvider implements WasmArtifactPort {
           command.path,
           WABT_LIMITS.toolBytes,
           options?.signal,
+          undefined,
+          this.#resources,
         );
         if (current.sha256 !== command.sha256)
           throw new AnalysisOutputError(
@@ -200,6 +234,8 @@ export class WabtArtifactProvider implements WasmArtifactPort {
         input.path,
         WABT_LIMITS.inputBytes,
         options?.signal,
+        undefined,
+        this.#resources,
       );
       const artifact = {
         path: input.path,
@@ -215,6 +251,8 @@ export class WabtArtifactProvider implements WasmArtifactPort {
                 path,
                 WABT_LIMITS.inputBytes,
                 options?.signal,
+                undefined,
+                this.#resources,
               );
         candidates.push({
           path,
@@ -228,10 +266,14 @@ export class WabtArtifactProvider implements WasmArtifactPort {
           path,
           WABT_LIMITS.inputBytes,
           options?.signal,
+          undefined,
+          this.#resources,
         );
-        const source = new TextDecoder("utf-8", { fatal: true }).decode(
-          bytes.bytes,
-        );
+        // Keep source characters intact so locations match the hashed artifact.
+        const source = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(bytes.bytes);
         glue.push({
           artifact: { path, sha256: bytes.sha256, bytes: bytes.bytes.length },
           ...associateWasmGlue(
@@ -323,8 +365,13 @@ export class WabtArtifactProvider implements WasmArtifactPort {
           OPERATION,
           "Unexpected WABT decoding output.",
         );
-      const { imports, exports, customSectionNames, debugModuleNames } =
-        parseWabtWat(wat.stdout.text);
+      const {
+        imports,
+        exports,
+        customSectionNames,
+        debugModuleNames,
+        interface: interfaceFacts,
+      } = parseWabtWat(wat.stdout.text);
       capturedOutput = {
         stdout: dump.stdout.text,
         stderr: dump.stderr.text,
@@ -349,6 +396,7 @@ export class WabtArtifactProvider implements WasmArtifactPort {
         sections,
         imports,
         exports,
+        interface: interfaceFacts,
         headers,
         details,
         wat: {
@@ -395,10 +443,13 @@ export class WabtArtifactProvider implements WasmArtifactPort {
       );
     }
     if (root !== undefined) {
-      try {
-        await root.close();
-      } catch (cause: unknown) {
-        this.#pendingRoots.add(root);
+      const cleanup = await this.#resources.release({
+        kind: "private-runtime-root",
+        resource: root.path,
+        root,
+      });
+      if (cleanup.kind === "failed") {
+        const cause = cleanup.cause;
         const partialObservation = result.ok
           ? createEvidence(
               result.value.subject ?? undefined,

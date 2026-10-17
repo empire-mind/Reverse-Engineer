@@ -47,13 +47,15 @@ describe("parameter references copied into function body bindings", () => {
         scopeId: "body",
         name: "arg",
         kind: "variable",
+        declarationKinds: new Set(),
         mutable: true,
-        mutatedPaths: [],
+        memberWrites: [],
         escapedPaths: [],
         definitions: [],
         initializers: [entry, assigned],
         referenceInitializers: [],
         directOrigins: [],
+        runtimeImport: false,
       };
       const origins = semanticMutationInitializers(binding, mutation, parents);
       expect(origins.initializers.includes(entry)).toBe(retained);

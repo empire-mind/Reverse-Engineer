@@ -135,6 +135,57 @@ export const createGoBinaryFixture = (
   return { bytes, headerOffset, versionOffset, moduleOffset, moduleBytes };
 };
 
+/** Two writable ELF loads, as in a PIE whose build info is in the later load. */
+export const createGoSplitElfFixture = (
+  options: Parameters<typeof createGoBinaryFixture>[0] = {},
+) => {
+  const fixture = createGoBinaryFixture({ ...options, format: "elf" });
+  const { bytes, headerOffset } = fixture;
+  const wide = (options.bits ?? 64) === 64;
+  const little = (options.byteOrder ?? "little") === "little";
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const word = (offset: number, value: number) => {
+    if (wide) view.setBigUint64(offset, BigInt(value), little);
+    else view.setUint32(offset, value, little);
+  };
+  const second = 128 + (wide ? 56 : 32);
+  bytes.copy(bytes, second, 128, second);
+  view.setUint16(wide ? 56 : 44, 2, little);
+  word(128 + (wide ? 32 : 16), headerOffset);
+  word(128 + (wide ? 40 : 20), headerOffset);
+  word(second + (wide ? 8 : 4), headerOffset);
+  word(second + (wide ? 16 : 8), 0x10000 + headerOffset);
+  word(second + (wide ? 32 : 16), bytes.length - headerOffset);
+  word(second + (wide ? 40 : 20), bytes.length - headerOffset);
+  return fixture;
+};
+
+/** Many file-backed ELF loads sharing a small input, without any metadata marker. */
+export const createGoOverlappingElfFixture = (duplicate = false): Buffer => {
+  const count = 257;
+  const size = 1024 * 1024;
+  const dataStart = 65536;
+  const bytes = Buffer.alloc(dataStart + size + count * 16);
+  createGoBinaryFixture({ sectionless: true, omitBuildInfo: true }).bytes.copy(
+    bytes,
+    0,
+    0,
+    64,
+  );
+  bytes.writeUInt16LE(count, 56);
+  for (let index = 0; index < count; index++) {
+    const header = 128 + index * 56;
+    const offset = dataStart + (duplicate ? 0 : index * 16);
+    bytes.writeUInt32LE(1, header);
+    bytes.writeUInt32LE(6, header + 4);
+    bytes.writeBigUInt64LE(BigInt(offset), header + 8);
+    bytes.writeBigUInt64LE(0x400000n + BigInt(offset), header + 16);
+    bytes.writeBigUInt64LE(BigInt(size), header + 32);
+    bytes.writeBigUInt64LE(BigInt(size), header + 40);
+  }
+  return bytes;
+};
+
 /** Embedded invalid UTF-8 alongside valid records, with exact independent byte expectations. */
 export const createGoBinaryByteStringFixture = () => {
   const version = Buffer.from("xgo1.26.0");
@@ -203,6 +254,14 @@ export const createGoBinaryDiagnosticFixtures = () => {
   }
   const damagedPe = createGoBinaryFixture({ format: "pe" }).bytes;
   damagedPe.write("NO", 128, "ascii");
+  const highBitSignatures = ["NE", "LE", "LX", "PE"].map((signature) => {
+    const bytes = createGoBinaryFixture({ format: "pe" }).bytes;
+    bytes.set(
+      [...Buffer.from(signature)].map((byte) => byte | 0x80),
+      128,
+    );
+    return { name: `high-bit-${signature.toLowerCase()}`, bytes };
+  });
   const absentDirectories = createGoBinaryFixture({ format: "pe" }).bytes;
   absentDirectories.writeUInt32LE(1, 152 + 108);
   const shortOptionalHeaders = [0, 1].map((size) => {
@@ -220,6 +279,7 @@ export const createGoBinaryDiagnosticFixtures = () => {
     })),
     ...[
       { name: "damaged-pe", bytes: damagedPe },
+      ...highBitSignatures,
       { name: "absent-directories", bytes: absentDirectories },
       ...shortOptionalHeaders,
     ].map((fixture) => ({

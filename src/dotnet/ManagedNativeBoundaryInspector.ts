@@ -13,6 +13,7 @@ import {
   readManagedMetadataLayout,
   type ManagedMetadataLayout,
 } from "./ManagedMetadataLayout.js";
+import { readTypeMemberListFacts } from "./ManagedTypeMemberLists.js";
 import {
   readManagedPeLayout,
   type ManagedPeLayout,
@@ -108,10 +109,12 @@ const readBoundaryInventory = (
     metadataOffset,
     cli.metadata.size,
   );
+  const memberLists = readTypeMemberListFacts(bytes, layout);
   const inventory = readManagedMetadataInventory(
     bytes,
     layout,
     readManagedResourceDirectory(pe, issues),
+    memberLists,
   );
   return { layout, inventory };
 };
@@ -121,15 +124,8 @@ export const inspectManagedNativeBoundariesBytes = (
   bytes: Buffer,
   target: BinaryTarget,
 ): ManagedNativeBoundaryInspection => {
-  let pe: ManagedPeLayout;
-  try {
-    pe = readManagedPeLayout(bytes);
-  } catch (cause: unknown) {
-    if (!(cause instanceof ManagedReaderFailure)) throw cause;
-    return emptyInspection(target, bytes, "malformed", {
-      issues: [cause.issue],
-    });
-  }
+  // An unmappable PE layout is invalid input for every managed operation.
+  const pe = readManagedPeLayout(bytes);
   if (pe.cli === null)
     return emptyInspection(
       target,

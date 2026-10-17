@@ -30,6 +30,7 @@ const resolveReference = (
   root: Readonly<Record<string, unknown>>,
   reference: string,
 ): unknown => {
+  if (reference === "#") return root;
   if (!reference.startsWith("#/")) return undefined;
   let value: unknown = root;
   for (const token of reference.slice(2).split("/")) {
@@ -173,17 +174,6 @@ const flattenRootObjectUnion = (
   const required = sharedRequiredProperties(branches);
   // A field unique to a group still needs that group's required partners.
   // Counting properties alone would let optional fields pad an incomplete pair.
-  const dependencies = Object.fromEntries(
-    [...variants.keys()].flatMap((name) => {
-      const owners = branches.filter((branch) =>
-        Object.hasOwn(branch.properties ?? {}, name),
-      );
-      const partners = sharedRequiredProperties(owners).filter(
-        (partner) => partner !== name && !required.includes(partner),
-      );
-      return partners.length > 0 ? [[name, partners]] : [];
-    }),
-  );
   const fewestRequired = Math.min(
     ...branches.map((branch) => requiredProperties(branch).length),
   );
@@ -195,8 +185,13 @@ const flattenRootObjectUnion = (
       ? `Provide a complete input group: ${groups.join("; ")}.`
       : undefined,
   ].filter((text) => text !== undefined);
+  const {
+    dependencies: _dependencies,
+    dependentRequired: _dependentRequired,
+    ...presentation
+  } = rest;
   return {
-    ...rest,
+    ...presentation,
     type: "object",
     ...(description.length > 0 ? { description: description.join(" ") } : {}),
     properties: Object.fromEntries(
@@ -207,13 +202,6 @@ const flattenRootObjectUnion = (
     ),
     ...(required.length > 0 ? { required } : {}),
     ...(fewestRequired > 0 ? { minProperties: fewestRequired } : {}),
-    ...(Object.keys(dependencies).length > 0
-      ? {
-          [root.$schema === "http://json-schema.org/draft-07/schema#"
-            ? "dependencies"
-            : "dependentRequired"]: dependencies,
-        }
-      : {}),
     ...(branches.every((branch) => branch.additionalProperties === false)
       ? { additionalProperties: false }
       : {}),
@@ -227,5 +215,107 @@ export const presentInputJsonSchema = (
 ): Record<string, unknown> => {
   const flattened = flattenRootObjectUnion(root);
   const described = describeSchema(flattened, flattened, describeProperty);
-  return isObject(described) ? described : flattened;
+  if (!isObject(described)) return flattened;
+  const {
+    dependencies: _dependencies,
+    dependentRequired: _dependentRequired,
+    ...presentation
+  } = described;
+  const rootDependencies = isObject(described.dependentRequired)
+    ? described.dependentRequired
+    : isObject(described.dependencies)
+      ? described.dependencies
+      : undefined;
+  const dependencyGuidance =
+    rootDependencies === undefined
+      ? []
+      : Object.entries(rootDependencies).flatMap(([property, partners]) =>
+          Array.isArray(partners) &&
+          partners.every((partner) => typeof partner === "string")
+            ? [
+                `When ${property} is provided, also provide ${partners.join(" and ")}.`,
+              ]
+            : [],
+        );
+  if (dependencyGuidance.length === 0) return presentation;
+  const description = [
+    typeof presentation.description === "string"
+      ? presentation.description
+      : undefined,
+    ...dependencyGuidance,
+  ].filter((text) => text !== undefined);
+  return { ...presentation, description: description.join(" ") };
 };
+
+/**
+ * Clients that render advertised inputs into SDK declarations expand
+ * schema-local references with a shared per-input budget: Pi 1.1.0 code-mode
+ * allows 32 expansions and degrades every later reference to `unknown`
+ * (morluto/rea#1632), hiding the fields those references describe. The budget
+ * counts conservatively — every resolvable, non-cyclic reference occurrence
+ * in every schema position — so any reference-resolving client stays within
+ * its measured limit.
+ */
+export const advertisedReferenceExpansionBudget = 32;
+
+const definitionKeys = new Set(["$defs", "definitions"]);
+
+const countReferenceExpansions = (
+  node: unknown,
+  root: Readonly<Record<string, unknown>>,
+  active: ReadonlySet<string>,
+  count: { value: number },
+): void => {
+  if (Array.isArray(node)) {
+    node.forEach((child) =>
+      countReferenceExpansions(child, root, active, count),
+    );
+    return;
+  }
+  if (!isObject(node)) return;
+  if (typeof node.$ref === "string" && !active.has(node.$ref)) {
+    const target = resolveReference(root, node.$ref);
+    if (target !== undefined) {
+      count.value += 1;
+      countReferenceExpansions(
+        target,
+        root,
+        new Set([...active, node.$ref]),
+        count,
+      );
+      return;
+    }
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (definitionKeys.has(key)) continue;
+    if (schemaMaps.has(key) && isObject(value)) {
+      for (const child of Object.values(value))
+        countReferenceExpansions(child, root, active, count);
+    } else if (schemaArrays.has(key) || schemaChildren.has(key)) {
+      countReferenceExpansions(value, root, active, count);
+    }
+  }
+};
+
+/** Conservative client expansion count over every schema position. */
+export const countLocalReferenceExpansions = (
+  schema: Record<string, unknown>,
+): number => {
+  const count = { value: 0 };
+  countReferenceExpansions(schema, schema, new Set(), count);
+  return count.value;
+};
+
+/**
+ * Keep the shared-definition form of an advertised input while clients can
+ * still resolve it. Once rendering would exhaust the reference budget, fall
+ * back to the inline projection, which carries no shared definitions for the
+ * nonrecursive schemas this repository advertises, so every field renders
+ * with complete structure in every reference-resolving client.
+ */
+export const inputSchemaWithinReferenceExpansionBudget = (
+  shared: Record<string, unknown>,
+  inline: () => Record<string, unknown>,
+  budget: number,
+): Record<string, unknown> =>
+  countLocalReferenceExpansions(shared) <= budget ? shared : inline();

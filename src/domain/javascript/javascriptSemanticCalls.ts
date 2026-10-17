@@ -9,10 +9,8 @@ import type {
   JavaScriptSemanticClosureCapture,
   JavaScriptSemanticFrontier,
 } from "./javascriptSemanticIr.js";
-import {
-  semanticCallableIdForNode,
-  semanticReferenceRole,
-} from "./javascriptSemanticProjection.js";
+import { semanticReferenceRole } from "./javascriptSemanticProjection.js";
+import { createSemanticCallableStack } from "./javascriptSemanticCallableStack.js";
 import { semanticStaticPropertyKey } from "./javascriptAstValues.js";
 import {
   resolveSemanticBindingState,
@@ -85,14 +83,13 @@ export const collectJavaScriptSemanticCalls = (
     parameterBindingCache: new Map(),
     ancestors: [],
   };
-  const callableStack: JavaScriptSemanticCallable[] = [];
+  const callableStack = createSemanticCallableStack((callableId) =>
+    callableById.get(callableId),
+  );
   traverseJavaScriptAst(program, {
     enter: (node, parent) => {
-      const callableId = semanticCallableIdForNode(node);
-      const callable =
-        callableId === null ? undefined : callableById.get(callableId);
-      if (callable !== undefined) callableStack.push(callable);
-      const owner = enclosingFunction(callableStack);
+      callableStack.enter(node, parent);
+      const owner = enclosingFunction(callableStack.callables);
       collectCapture(node, parent, owner, context);
       collectDynamicProperty(node, owner, state, output);
       collectDynamicScope(node, owner, state, output);
@@ -106,12 +103,7 @@ export const collectJavaScriptSemanticCalls = (
     },
     exit: (node) => {
       context.ancestors.pop();
-      const callableId = semanticCallableIdForNode(node);
-      if (
-        callableId !== null &&
-        callableStack.at(-1)?.callableId === callableId
-      )
-        callableStack.pop();
+      callableStack.exit(node);
     },
   });
   return {

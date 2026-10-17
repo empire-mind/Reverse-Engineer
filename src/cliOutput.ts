@@ -9,7 +9,7 @@ export type CliOutputArgumentValidation =
   | {
       readonly ok: false;
       readonly format: StructuredOutputFormat;
-      readonly code: "UNSUPPORTED_OUTPUT_COMBINATION";
+      readonly code: "UNSUPPORTED_OUTPUT_COMBINATION" | "INVALID_OUTPUT_FILTER";
       readonly message: string;
     };
 
@@ -20,6 +20,8 @@ interface ParsedCliOutputArguments {
   readonly parseError: boolean;
   readonly tokenCount: boolean;
   readonly tokenWindow: boolean;
+  readonly tokenLimit: number | undefined;
+  readonly tokenOffset: number | undefined;
 }
 
 /** Read effective Incur output controls at the executable boundary. */
@@ -30,14 +32,18 @@ export const parseCliOutputArguments = (
   let filterOutput: string | undefined;
   let fullOutput = false;
   let tokenCount = false;
-  let tokenWindow = false;
+  let tokenLimit: number | undefined;
+  let tokenOffset: number | undefined;
   const parsed = (parseError: boolean): ParsedCliOutputArguments => ({
     filterOutput,
     format,
     fullOutput,
     parseError,
     tokenCount,
-    tokenWindow: parseError ? false : tokenWindow,
+    tokenWindow:
+      !parseError && (tokenLimit !== undefined || tokenOffset !== undefined),
+    tokenLimit: parseError ? undefined : tokenLimit,
+    tokenOffset: parseError ? undefined : tokenOffset,
   });
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -71,7 +77,8 @@ export const parseCliOutputArguments = (
         const numericValue = Number(value);
         if (!Number.isFinite(numericValue) || value.trim() === "")
           return parsed(true);
-        tokenWindow = true;
+        if (argument === "--token-limit") tokenLimit = numericValue;
+        else tokenOffset = numericValue;
         index += 1;
       }
       continue;
@@ -82,13 +89,39 @@ export const parseCliOutputArguments = (
   return parsed(false);
 };
 
-/** Reject text-window controls that would corrupt a structured document. */
+/** Reject slices that cannot advance within Incur's comma-delimited paths. */
+const hasUnclosedFilterSlice = (expression: string): boolean => {
+  let depth = 0;
+  let unclosed = false;
+  for (const character of expression) {
+    if (character === "[") {
+      depth += 1;
+      unclosed = true;
+    } else if (character === "]") {
+      depth -= 1;
+      // Incur consumes everything through the next closing bracket, including
+      // nested opening brackets. Do not impose a different filter grammar.
+      unclosed = false;
+    } else if (character === "," && depth === 0 && unclosed) return true;
+  }
+  return unclosed;
+};
+
+/** Reject output controls that cannot safely produce a complete result. */
 export const validateCliOutputArguments = (
   arguments_: readonly string[],
 ): CliOutputArgumentValidation => {
-  const { format, parseError, tokenWindow } =
+  const { filterOutput, format, parseError, tokenWindow } =
     parseCliOutputArguments(arguments_);
   if (parseError) return { ok: true };
+  if (filterOutput !== undefined && hasUnclosedFilterSlice(filterOutput))
+    return {
+      ok: false,
+      format: format === "yaml" || format === "jsonl" ? format : "json",
+      code: "INVALID_OUTPUT_FILTER",
+      message:
+        "The --filter-output expression has a slice without a closing ]. Close the slice or remove --filter-output.",
+    };
   if (
     tokenWindow &&
     (format === "json" || format === "jsonl" || format === "yaml")

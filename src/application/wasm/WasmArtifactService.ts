@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { ExecutionOptions } from "../AnalysisProvider.js";
 import type { WasmArtifactPort } from "./WasmArtifactPort.js";
@@ -7,11 +6,13 @@ import {
   AnalysisCancelledError,
   AnalysisInputError,
   AnalysisOutputError,
+  type AnalysisInputIssue,
 } from "../../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import {
   inspectWasmArtifactInputSchema,
   wasmArtifactSchema,
+  wasmArtifactMatchesSubject,
 } from "../../domain/wasm/wasmArtifact.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -41,22 +42,29 @@ export class WasmArtifactService {
           cause: input.error,
         }),
       );
-    if (
-      ![
-        input.data.path,
-        ...input.data.glue_paths,
-        ...input.data.candidate_paths,
-      ].every(isAbsolute)
-    )
-      return err(
-        new AnalysisInputError(OPERATION, undefined, [
-          {
-            path: ["path"],
-            reason: "invalid_format",
-            message: "Expected an absolute filesystem path on this host.",
-          },
-        ]),
-      );
+    const pathIssues = [
+      { value: input.data.path, path: ["path"] },
+      ...input.data.glue_paths.map((value, index) => ({
+        value,
+        path: ["glue_paths", index],
+      })),
+      ...input.data.candidate_paths.map((value, index) => ({
+        value,
+        path: ["candidate_paths", index],
+      })),
+    ].flatMap<AnalysisInputIssue>(({ value, path }) =>
+      isAbsolute(value)
+        ? []
+        : [
+            {
+              path,
+              reason: "invalid_format",
+              message: "Expected an absolute filesystem path on this host.",
+            },
+          ],
+    );
+    if (pathIssues.length > 0)
+      return err(new AnalysisInputError(OPERATION, undefined, pathIssues));
     const inspected = await this.provider.inspect(input.data, options);
     if (!inspected.ok) return inspected;
     if (options?.signal?.aborted)
@@ -66,10 +74,7 @@ export class WasmArtifactService {
     if (
       !report.success ||
       report.data.artifact.path !== input.data.path ||
-      execution.subject?.path !== input.data.path ||
-      execution.subject.sha256 !== report.data.artifact.sha256 ||
-      createHash("sha256").update(report.data.wat.text).digest("hex") !==
-        report.data.wat.sha256 ||
+      !wasmArtifactMatchesSubject(report.data.artifact, execution.subject) ||
       JSON.stringify(report.data.glue.map((item) => item.artifact.path)) !==
         JSON.stringify(input.data.glue_paths) ||
       JSON.stringify(report.data.candidates.map((item) => item.path)) !==

@@ -1,5 +1,10 @@
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
+import { isJavaScriptSourcePath } from "../../domain/javascript/javascriptArtifactFiles.js";
 import { digestCanonicalValue } from "../../domain/canonicalDigest.js";
+import {
+  hasBinaryPlistSignature,
+  hasXmlPlistSignature,
+} from "../../domain/apple/appleArchiveFormat.js";
 import {
   artifactEdgeId,
   artifactIdForContent,
@@ -18,7 +23,14 @@ import {
   zipPackageFormatForPath,
   type ZipPackageFormat,
 } from "../../domain/zipPackageFormat.js";
-import { mzWindowsHeaderOffset, parseDosMzHeader } from "../../domain/dosMz.js";
+import {
+  observeMzWindowsHeader,
+  parseDosMzHeader,
+} from "../../domain/dosMz.js";
+import {
+  classifyFatContainerIdentity,
+  readFatContainerHeader,
+} from "../../domain/apple/machoContainer.js";
 
 /** Mutable internal occurrence used until root-bound IDs are known. */
 export interface MutableOccurrence {
@@ -38,14 +50,17 @@ export interface MutableOccurrence {
   limitations: string[];
 }
 
-/** Index the first occurrence for each canonical logical path. */
+/** Index every occurrence by canonical logical path without choosing an owner. */
 export const indexOccurrencesByPath = (
   occurrences: readonly MutableOccurrence[],
-): ReadonlyMap<string, MutableOccurrence> => {
-  const byPath = new Map<string, MutableOccurrence>();
-  for (const occurrence of occurrences)
-    if (!byPath.has(occurrence.logical_path))
-      byPath.set(occurrence.logical_path, occurrence);
+): ReadonlyMap<string, readonly MutableOccurrence[]> => {
+  const byPath = new Map<string, MutableOccurrence[]>();
+  for (const occurrence of occurrences) {
+    const matches = byPath.get(occurrence.logical_path);
+    if (matches === undefined)
+      byPath.set(occurrence.logical_path, [occurrence]);
+    else matches.push(occurrence);
+  }
   return byPath;
 };
 
@@ -58,6 +73,7 @@ export const createOccurrence = (
   entry: ArtifactEntry,
   path: string,
   parent: string | null,
+  duplicateOrdinal = 0,
 ): MutableOccurrence => {
   const role =
     entry.kind === "directory"
@@ -71,7 +87,12 @@ export const createOccurrence = (
         ? classifyArtifactPath(path)
         : ({ kind: "unknown", format: "unknown" } as const);
   return {
-    occurrence_id: `occ_${digestCanonicalValue({ path, kind: entry.kind }, "Artifact")}`,
+    occurrence_id: `occ_${digestCanonicalValue(
+      duplicateOrdinal === 0
+        ? { path, kind: entry.kind }
+        : { path, kind: entry.kind, duplicate_ordinal: duplicateOrdinal },
+      "Artifact",
+    )}`,
     artifact_id: null,
     parent_occurrence_id: parent,
     logical_path: path,
@@ -116,7 +137,10 @@ export const materializeDirectoryNodes = (
   nodes: Map<string, ArtifactNode>,
 ): void => {
   const directories = occurrences
-    .filter(({ entry_kind: kind }) => kind === "directory")
+    .filter(
+      ({ entry_kind: kind, hash_status }) =>
+        kind === "directory" && hash_status !== "unavailable",
+    )
     .sort(
       (left, right) => depth(right.logical_path) - depth(left.logical_path),
     );
@@ -237,15 +261,20 @@ export const rekeyOccurrences = (
   occurrences: MutableOccurrence[],
 ): void => {
   const replacements = new Map<string, string>();
-  for (const occurrence of occurrences)
+  const ordinalByPath = new Map<string, number>();
+  for (const occurrence of occurrences) {
+    const ordinal = ordinalByPath.get(occurrence.logical_path) ?? 0;
+    ordinalByPath.set(occurrence.logical_path, ordinal + 1);
     replacements.set(
       occurrence.occurrence_id,
       occurrenceIdForLocation({
         rootArtifactId,
         logicalPath: occurrence.logical_path,
         entryKind: occurrence.entry_kind,
+        ...(ordinal === 0 ? {} : { duplicateOrdinal: ordinal }),
       }),
     );
+  }
   for (const occurrence of occurrences) {
     occurrence.occurrence_id =
       replacements.get(occurrence.occurrence_id) ?? occurrence.occurrence_id;
@@ -260,19 +289,45 @@ export const createArtifactEdges = (
   rootArtifactId: string,
   occurrences: MutableOccurrence[],
   producer?: ArtifactCommand,
-): ArtifactEdge[] => {
+): { readonly edges: ArtifactEdge[]; readonly limitations: string[] } => {
   const byId = new Map(occurrences.map((item) => [item.occurrence_id, item]));
   const byPath = indexOccurrencesByPath(occurrences);
   const edges: ArtifactEdge[] = [];
+  const limitations: string[] = [];
   for (const occurrence of occurrences) {
+    const isSourceMap = occurrence.logical_path.toLowerCase().endsWith(".map");
+    const sourcePath = isSourceMap
+      ? occurrence.logical_path.slice(0, -".map".length)
+      : undefined;
+    const sourceCandidates =
+      sourcePath === undefined ? [] : (byPath.get(sourcePath) ?? []);
+    const mappedSource =
+      sourceCandidates.length === 1 && sourceCandidates[0]?.artifact_id !== null
+        ? sourceCandidates[0]
+        : undefined;
+    if (sourcePath !== undefined) {
+      const unknownMapping =
+        sourceCandidates.length > 1
+          ? {
+              occurrence: `Source-map target is unknown because multiple occurrences share ${JSON.stringify(sourcePath)}.`,
+              coverage: `Source-map relationships are unknown because multiple occurrences share ${JSON.stringify(sourcePath)}.`,
+            }
+          : sourceCandidates.length === 1 && mappedSource === undefined
+            ? {
+                occurrence: `Source-map target identity is unknown because the matching occurrence at ${JSON.stringify(sourcePath)} has no content identity.`,
+                coverage: `Source-map relationships are unknown because the matching occurrence at ${JSON.stringify(sourcePath)} has no content identity.`,
+              }
+            : undefined;
+      if (unknownMapping !== undefined) {
+        occurrence.limitations.push(unknownMapping.occurrence);
+        limitations.push(unknownMapping.coverage);
+      }
+    }
     if (
       occurrence.parent_occurrence_id === null ||
       occurrence.artifact_id === null
     )
       continue;
-    const mappedSource = occurrence.logical_path.toLowerCase().endsWith(".map")
-      ? byPath.get(occurrence.logical_path.slice(0, -".map".length))
-      : undefined;
     const parentArtifactId =
       mappedSource?.artifact_id ??
       byId.get(occurrence.parent_occurrence_id)?.artifact_id ??
@@ -282,7 +337,9 @@ export const createArtifactEdges = (
       relation:
         occurrence.entry_kind === "slice"
           ? ("slice-of" as const)
-          : relationFor(occurrence.logical_path),
+          : isSourceMap && mappedSource === undefined
+            ? ("contains" as const)
+            : relationFor(occurrence.logical_path),
       occurrence_id: occurrence.occurrence_id,
     };
     edges.push({
@@ -292,29 +349,44 @@ export const createArtifactEdges = (
       ordinal: edges.length,
     });
   }
-  return edges;
+  return { edges, limitations };
 };
 
 interface ArtifactParentIndex {
   readonly children: Map<string, ArtifactParentIndex>;
-  occurrence?: MutableOccurrence;
+  occurrences?: readonly MutableOccurrence[];
 }
 
 /** Resolve strict observed ancestors without rebuilding every path prefix. */
 export const resolveOccurrenceParents = (
   occurrences: readonly MutableOccurrence[],
-  byPath: ReadonlyMap<string, MutableOccurrence>,
+  byPath: ReadonlyMap<string, readonly MutableOccurrence[]>,
   expandedContainerIds: ReadonlySet<string>,
-): void => {
+): {
+  readonly limitations: readonly string[];
+  readonly unknownParentOccurrences: ReadonlySet<MutableOccurrence>;
+} => {
   const root: ArtifactParentIndex = { children: new Map() };
-  for (const occurrence of byPath.values()) {
-    if (
-      occurrence.entry_kind !== "directory" &&
-      !expandedContainerIds.has(occurrence.occurrence_id)
-    )
-      continue;
+  for (const matches of byPath.values()) {
+    const parents = matches.filter(
+      (occurrence) =>
+        occurrence.entry_kind === "directory" ||
+        expandedContainerIds.has(occurrence.occurrence_id),
+    );
+    if (parents.length === 0) continue;
+    if (parents.length > 1)
+      for (const parent of parents)
+        if (parent.entry_kind === "directory") {
+          parent.artifact_id = null;
+          parent.hash_status = "unavailable";
+          parent.limitations.push(
+            "This directory occurrence cannot be materialized because multiple directory entries share its logical path.",
+          );
+        }
+    const path = matches[0]?.logical_path;
+    if (path === undefined) continue;
     let branch = root;
-    for (const segment of occurrence.logical_path.split("/")) {
+    for (const segment of path.split("/")) {
       let child = branch.children.get(segment);
       if (child === undefined) {
         child = { children: new Map() };
@@ -322,12 +394,16 @@ export const resolveOccurrenceParents = (
       }
       branch = child;
     }
-    branch.occurrence = occurrence;
+    branch.occurrences = parents;
   }
+  const limitations = new Set<string>();
+  const unknownParentOccurrences = new Set<MutableOccurrence>();
   for (const occurrence of occurrences) {
     const path = occurrence.logical_path;
     let branch = root;
     let parent: MutableOccurrence | undefined;
+    let ambiguousParentPath: string | undefined;
+    let prefix = "";
     // Walk parent segments only. Stop scanning the path once no observed
     // directory or expanded container can be an ancestor.
     for (let start = 0; ;) {
@@ -337,11 +413,29 @@ export const resolveOccurrenceParents = (
       const child = branch.children.get(segment);
       if (child === undefined) break;
       branch = child;
-      parent = branch.occurrence ?? parent;
+      prefix = prefix.length === 0 ? segment : `${prefix}/${segment}`;
+      const candidates = branch.occurrences ?? [];
+      if (candidates.length === 1) {
+        parent = candidates[0];
+        ambiguousParentPath = undefined;
+      } else if (candidates.length > 1) {
+        parent = undefined;
+        ambiguousParentPath = prefix;
+      }
       start = slash + 1;
     }
     occurrence.parent_occurrence_id = parent?.occurrence_id ?? null;
+    if (ambiguousParentPath !== undefined) {
+      const limitation = `The parent occurrence for ${JSON.stringify(path)} is unknown because multiple observed directory or container occurrences share ${JSON.stringify(ambiguousParentPath)}.`;
+      occurrence.limitations.push(limitation);
+      limitations.add(limitation);
+      unknownParentOccurrences.add(occurrence);
+    }
   }
+  return {
+    limitations: [...limitations].sort(compareUnicodeCodePoints),
+    unknownParentOccurrences,
+  };
 };
 
 /**
@@ -357,7 +451,7 @@ export const classifyArtifactPath = (
   const lower = path.toLowerCase();
   if (lower.endsWith(".map"))
     return { kind: "source-map", format: "source-map" };
-  if (/\.(?:m?js|cjs)$/u.test(lower))
+  if (isJavaScriptSourcePath(path))
     return { kind: "javascript", format: "javascript-bundle" };
   if (/\.framework(?:\/|$)/u.test(lower))
     return { kind: "framework", format: "file" };
@@ -382,6 +476,14 @@ export const classifyArtifactContent = (
   readonly format: ArtifactOccurrence["artifact_format"];
 } => {
   const format = classifyArtifactBytes(prefix, fileSize);
+  const byPath = classifyArtifactPath(path);
+  if (
+    format === "plist" &&
+    !hasBinaryPlistSignature(prefix) &&
+    (["javascript", "source-map", "entitlements"].includes(byPath.kind) ||
+      path.toLowerCase().endsWith(".asar"))
+  )
+    return byPath;
   if (
     format === "file" &&
     path.toLowerCase().endsWith(".asar") &&
@@ -433,11 +535,12 @@ export const classifyArtifactBytes = (
   fileSize = prefix.length,
 ): ArtifactNode["format"] => {
   if (hasZipSignature(prefix)) return "zip";
-  if (prefix.subarray(0, 8).equals(Buffer.from("bplist00"))) return "plist";
+  if (hasBinaryPlistSignature(prefix)) return "plist";
+  if (hasXmlPlistSignature(prefix)) return "plist";
+  const fatFormat = classifyFatArtifact(prefix, fileSize);
+  if (fatFormat !== null) return fatFormat;
   if (prefix.length >= 4) {
     const magic = prefix.readUInt32BE(0);
-    if ([0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca].includes(magic))
-      return "mach-o-universal";
     if ([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(magic))
       return "mach-o";
     if (prefix.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])))
@@ -450,20 +553,38 @@ export const classifyArtifactBytes = (
       prefix.length < Math.min(fileSize, 64)
     )
       return "unknown";
-    const windowsOffset = mzWindowsHeaderOffset(prefix);
-    if (windowsOffset !== null) {
+    const windowsHeader = observeMzWindowsHeader(prefix, fileSize);
+    if (windowsHeader.state === "signature-needed") return "unknown";
+    if (windowsHeader.state === "declared") {
+      const windowsOffset = windowsHeader.offset;
       if (
+        windowsHeader.signature === "PE" &&
         windowsOffset >= 64 &&
-        windowsOffset <= prefix.length - 4 &&
-        prefix
-          .subarray(windowsOffset, windowsOffset + 4)
-          .equals(Buffer.from([0x50, 0x45, 0, 0]))
+        windowsOffset <= prefix.length - 4
       )
         return "pe";
-    } else if (parseDosMzHeader(prefix, fileSize).ok) return "dos-mz";
+      return "unknown";
+    }
+    if (parseDosMzHeader(prefix, fileSize).ok) return "dos-mz";
     return "unknown";
   }
   return "file";
+};
+
+const classifyFatArtifact = (
+  prefix: Buffer,
+  fileSize: number,
+): ArtifactNode["format"] | null => {
+  const fatHeader = readFatContainerHeader(prefix, fileSize);
+  if (fatHeader.state === "needs-data" || fatHeader.state === "malformed")
+    return "unknown";
+  if (fatHeader.state === "not-fat") return null;
+  const identity = classifyFatContainerIdentity(fatHeader, (offset) => {
+    if (offset >= prefix.length) return undefined;
+    if (offset + 4 > prefix.length) return null;
+    return prefix.readUInt32BE(offset);
+  });
+  return identity.state === "mach-o" ? "mach-o-universal" : "unknown";
 };
 
 const relationFor = (path: string): ArtifactEdge["relation"] => {

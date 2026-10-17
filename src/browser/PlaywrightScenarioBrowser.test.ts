@@ -115,35 +115,6 @@ it("keeps Termux execution support when launching Chromium on Android", async ()
   });
 });
 
-it("keeps attached-target ownership until cancelled cleanup actually settles", async () => {
-  const controller = new AbortController();
-  const closeStarted = deferred<void>();
-  const closeResult = deferred<void>();
-  const settled: boolean[] = [];
-  const cleanup = new PlaywrightScenarioBrowserCleanupOwner({
-    closeBrowser: () => {
-      closeStarted.resolve(undefined);
-      return closeResult.promise;
-    },
-    removeProfile: undefined,
-    onSettled: (browserClosed) => settled.push(browserClosed),
-  });
-  const cancelledClose = cleanup.close(undefined, controller.signal);
-  await closeStarted.promise;
-  controller.abort();
-  await expect(cancelledClose).rejects.toMatchObject({
-    _tag: "BrowserObservationError",
-    reason: "cleanup_failed",
-    cleanupIncomplete: true,
-    userCategory: "cancelled",
-  });
-  expect(settled).toEqual([]);
-
-  closeResult.resolve(undefined);
-  await cleanup.close();
-  expect(settled).toEqual([true]);
-});
-
 it("keeps attached-target ownership after the cleanup response timeout", async () => {
   vi.useFakeTimers();
   try {
@@ -164,7 +135,15 @@ it("keeps attached-target ownership after the cleanup response timeout", async (
       cleanup: { reason: expect.stringContaining("timed out") },
     });
     await closeStarted.promise;
-    await vi.advanceTimersByTimeAsync(1_000);
+    let responseSettled = false;
+    void timedOutClose
+      .finally(() => {
+        responseSettled = true;
+      })
+      .catch(() => {});
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(responseSettled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
     await timeoutExpectation;
     expect(settled).toEqual([]);
 

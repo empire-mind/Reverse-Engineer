@@ -4,6 +4,15 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 
 import { TOOL_CONTRACTS } from "../../../src/contracts/toolContracts.js";
+import { PROMPT_CONTRACTS } from "../../../src/contracts/promptContracts.js";
+import { advertisedInputJsonSchema } from "../../../src/contracts/toolSchemaMetadata.js";
+import { presentAdvertisedInputSchema } from "../../../src/contracts/compactInputSchema.js";
+import { createCatalogDigests } from "../../../src/catalogIdentity.js";
+import {
+  schemaArrays,
+  schemaChildren,
+  schemaMaps,
+} from "../../../src/contracts/inputSchemaPresentation.js";
 import {
   COMPACT_INPUT_SCHEMA_BUDGET_BYTES,
   parseMcpInputSchemaProfile,
@@ -22,6 +31,45 @@ interface AdvertisedTool {
 
 const serializedBytes = (value: unknown): number =>
   Buffer.byteLength(JSON.stringify(value), "utf8");
+
+const schemaDepth = (value: unknown, depth = 0): number => {
+  if (Array.isArray(value))
+    return Math.max(
+      depth,
+      ...value.map((child) => schemaDepth(child, depth + 1)),
+    );
+  if (typeof value !== "object" || value === null) return depth;
+  return Math.max(
+    depth,
+    ...Object.values(value).map((child) => schemaDepth(child, depth + 1)),
+  );
+};
+
+const unsupportedDependencyKeywords = (
+  schema: unknown,
+  path = "$",
+): readonly string[] => {
+  if (Array.isArray(schema))
+    return schema.flatMap((child, index) =>
+      unsupportedDependencyKeywords(child, `${path}[${index}]`),
+    );
+  if (typeof schema !== "object" || schema === null) return [];
+  return Object.entries(schema).flatMap(([key, value]) => {
+    const childPath = `${path}.${key}`;
+    if (key === "dependencies" || key === "dependentRequired")
+      return [childPath];
+    if (["const", "enum", "default", "examples"].includes(key)) return [];
+    if (schemaMaps.has(key) && typeof value === "object" && value !== null)
+      return Object.entries(value).flatMap(([name, child]) =>
+        unsupportedDependencyKeywords(child, `${childPath}.${name}`),
+      );
+    if (schemaArrays.has(key) && Array.isArray(value))
+      return unsupportedDependencyKeywords(value, childPath);
+    if (schemaChildren.has(key))
+      return unsupportedDependencyKeywords(value, childPath);
+    return [];
+  });
+};
 
 const listToolsThroughTransport = async (
   server: EvidenceMcpServer,
@@ -65,6 +113,68 @@ const fullServer = (): EvidenceMcpServer =>
   );
 
 describe("MCP compact input schema profile", () => {
+  it("matches profile digests to tools/list and excludes stripped annotations", async () => {
+    const compactPresentation = {
+      budgetBytes: COMPACT_INPUT_SCHEMA_BUDGET_BYTES,
+    };
+    const full = fullServer();
+    const compact = compactServer();
+    registerCatalog(full);
+    registerCatalog(compact);
+    const [fullTools, compactTools] = await Promise.all([
+      listToolsThroughTransport(full),
+      listToolsThroughTransport(compact),
+    ]);
+    const toolsByName = [
+      new Map(fullTools.map((tool) => [tool.name, tool])),
+      new Map(compactTools.map((tool) => [tool.name, tool])),
+    ];
+    for (const [index, presentation] of [
+      undefined,
+      compactPresentation,
+    ].entries()) {
+      for (const contract of TOOL_CONTRACTS) {
+        expect(toolsByName[index]?.get(contract.name)?.inputSchema).toEqual(
+          presentAdvertisedInputSchema(
+            advertisedInputJsonSchema(contract),
+            presentation,
+          ),
+        );
+      }
+    }
+
+    const fullIdentity = createCatalogDigests();
+    const compactIdentity = createCatalogDigests(
+      TOOL_CONTRACTS,
+      PROMPT_CONTRACTS,
+      compactPresentation,
+    );
+    expect(full.catalogIdentity.digests).toEqual(fullIdentity);
+    expect(compact.catalogIdentity.digests).toEqual(compactIdentity);
+    expect(compactIdentity.tools_sha256).not.toBe(fullIdentity.tools_sha256);
+    expect(
+      createCatalogDigests(TOOL_CONTRACTS, PROMPT_CONTRACTS, {
+        budgetBytes: 1,
+      }).tools_sha256,
+    ).not.toBe(compactIdentity.tools_sha256);
+
+    const withoutExamples = TOOL_CONTRACTS.map((contract) =>
+      contract.examples.length === 0 ? contract : { ...contract, examples: [] },
+    );
+    expect(createCatalogDigests(withoutExamples).tools_sha256).not.toBe(
+      fullIdentity.tools_sha256,
+    );
+    expect(
+      createCatalogDigests(
+        withoutExamples,
+        PROMPT_CONTRACTS,
+        compactPresentation,
+      ).tools_sha256,
+    ).toBe(compactIdentity.tools_sha256);
+  });
+});
+
+describe("MCP compact schema constraints", () => {
   it("advertises every tool input schema within the provider budget", async () => {
     const server = compactServer();
     registerCatalog(server);
@@ -77,6 +187,12 @@ describe("MCP compact input schema profile", () => {
         serializedBytes(inputSchema) > COMPACT_INPUT_SCHEMA_BUDGET_BYTES,
     );
     expect(oversized.map(({ name }) => name)).toEqual([]);
+    const tooDeep = tools.filter(
+      ({ inputSchema }) => schemaDepth(inputSchema) > 10,
+    );
+    expect(
+      tooDeep.map(({ name, inputSchema }) => [name, schemaDepth(inputSchema)]),
+    ).toEqual([]);
   });
 
   it("keeps output schemas and tool descriptions identical to the default profile", async () => {
@@ -120,6 +236,31 @@ describe("MCP compact input schema profile", () => {
     }
   });
 
+  it("omits Gemini-unsupported dependency keywords from both catalog profiles", async () => {
+    const full = fullServer();
+    const compact = compactServer();
+    registerCatalog(full);
+    registerCatalog(compact);
+    const [fullTools, compactTools] = await Promise.all([
+      listToolsThroughTransport(full),
+      listToolsThroughTransport(compact),
+    ]);
+    for (const tools of [fullTools, compactTools])
+      expect(
+        tools.flatMap(({ name, inputSchema }) =>
+          unsupportedDependencyKeywords(inputSchema).map(
+            (path) => `${name}${path.slice(1)}`,
+          ),
+        ),
+      ).toEqual([]);
+    const sqlite = fullTools.find(
+      ({ name }) => name === "inspect_sqlite_database",
+    );
+    expect(sqlite?.inputSchema.description).toContain(
+      "When row_limit is provided, also provide table.",
+    );
+  });
+
   it("retains parameter types and avoids client-side reference expansion", async () => {
     const server = compactServer();
     registerCatalog(server);
@@ -136,13 +277,7 @@ describe("MCP compact input schema profile", () => {
       ({ name }) => name === "compare_managed_members",
     );
     expect(comparison?.inputSchema.properties).toMatchObject({
-      left: {
-        properties: {
-          normalized_result: {
-            type: ["null", "boolean", "object", "array", "number", "string"],
-          },
-        },
-      },
+      left: { type: "object" },
     });
     const ledger = tools.find(
       ({ name }) => name === "build_reconstruction_obligation_ledger",

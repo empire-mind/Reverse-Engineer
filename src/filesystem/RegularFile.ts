@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
+import { constants as osConstants } from "node:os";
 import type { BigIntStats, Stats } from "node:fs";
-import { open, type FileHandle } from "node:fs/promises";
+import { lstat, open, stat, type FileHandle } from "node:fs/promises";
 
 import { OwnedFileHandle } from "./OwnedFileHandle.js";
 
@@ -66,7 +67,17 @@ export const openRegularFile = async (
       (constants.O_NONBLOCK ?? 0) |
       (constants.O_NOCTTY ?? 0) |
       (options.symlinks === "reject" ? (constants.O_NOFOLLOW ?? 0) : 0),
-  );
+  ).catch(async (cause: unknown) => {
+    const nonRegular = await nonRegularOpenFailure(
+      path,
+      options.symlinks,
+      cause,
+    );
+    if (nonRegular === undefined) throw cause;
+    // Cancellation during the metadata probe outranks the reclassification.
+    options.signal?.throwIfAborted();
+    throw nonRegular;
+  });
   const owner = new OwnedFileHandle(handle);
   try {
     options.signal?.throwIfAborted();
@@ -74,6 +85,16 @@ export const openRegularFile = async (
     options.signal?.throwIfAborted();
     if (!metadata.isFile())
       throw new NonRegularFileReadError(path, metadata.isDirectory());
+    // O_NOFOLLOW is unavailable on Windows. Recheck the name only on hosts
+    // where open could have followed a symlink, while the descriptor is owned.
+    if (options.symlinks === "reject" && (constants.O_NOFOLLOW ?? 0) === 0) {
+      const named = await lstat(path);
+      options.signal?.throwIfAborted();
+      if (named.isSymbolicLink())
+        throw new NonRegularFileReadError(path, false);
+      if (!sameRegularFileState(metadata, named))
+        throw new RegularFileChangedError(path);
+    }
     return handle;
   } catch (cause: unknown) {
     try {
@@ -85,6 +106,41 @@ export const openRegularFile = async (
   }
 };
 
+/**
+ * Some non-regular files cannot be opened at all: a Unix socket fails with
+ * ENXIO on Linux and EOPNOTSUPP on macOS. Confirm such a failure against the
+ * path's own metadata before reporting a non-regular selection.
+ */
+const nonRegularOpenFailure = async (
+  path: string,
+  symlinks: "follow" | "reject",
+  cause: unknown,
+): Promise<NonRegularFileReadError | undefined> => {
+  // Only errors meaning "this file type cannot be opened" are reclassified;
+  // permission, symlink-rejection and resource failures keep their codes.
+  if (!isUnopenableFileTypeError(cause)) return undefined;
+  const metadata = await (symlinks === "reject" ? lstat : stat)(path).catch(
+    () => undefined,
+  );
+  if (metadata === undefined || metadata.isFile()) return undefined;
+  return new NonRegularFileReadError(path, metadata.isDirectory());
+};
+
+// Match by errno: libuv has no name for macOS EOPNOTSUPP (102) and reports
+// "Unknown system error -102" as its code.
+const errnos: Partial<Record<string, number>> = osConstants.errno;
+const UNOPENABLE_FILE_TYPE_ERRNOS: ReadonlySet<number> = new Set(
+  [errnos.ENXIO, errnos.EOPNOTSUPP, errnos.ENOTSUP].flatMap((errno) =>
+    errno === undefined ? [] : [-errno],
+  ),
+);
+
+const isUnopenableFileTypeError = (cause: unknown): boolean =>
+  cause instanceof Error &&
+  "errno" in cause &&
+  typeof cause.errno === "number" &&
+  UNOPENABLE_FILE_TYPE_ERRNOS.has(cause.errno);
+
 /** Compare one regular file's identity and mutable metadata across a read. */
 export const sameRegularFileState = (
   expected: Stats | BigIntStats,
@@ -95,5 +151,8 @@ export const sameRegularFileState = (
   expected.ino === observed.ino &&
   expected.size === observed.size &&
   expected.mode === observed.mode &&
-  expected.mtimeMs === observed.mtimeMs &&
-  expected.ctimeMs === observed.ctimeMs;
+  ("mtimeNs" in expected && "mtimeNs" in observed
+    ? expected.mtimeNs === observed.mtimeNs &&
+      expected.ctimeNs === observed.ctimeNs
+    : expected.mtimeMs === observed.mtimeMs &&
+      expected.ctimeMs === observed.ctimeMs);

@@ -1,5 +1,6 @@
 import { constants as fsConstants } from "node:fs";
 import {
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -21,6 +22,7 @@ import { PRODUCT_IDENTITY } from "../../../src/identity.js";
 
 import { readClientRegistrationStatuses } from "../../../src/application/ClientRegistrationStatus.js";
 import { configureClientConfiguration } from "../../../src/application/SetupClientConfiguration.js";
+import { readConfigurationFile } from "../../../src/application/ClientConfigurationFiles.js";
 import {
   detectClients,
   systemSetupHost,
@@ -62,11 +64,17 @@ describe("client configuration filesystem lifecycle", () => {
       "copilot_cli",
       "commandcode",
       "qwen_code",
+      "kimi",
       "vscode",
+      "trae",
+      "workbuddy",
       "grok_build",
       "omp",
       "pi",
       "hermes",
+      "qoder",
+      "droid",
+      "zcode",
       "dsh",
       "grok_bot",
     ]);
@@ -1327,7 +1335,7 @@ describe("Codex configuration comments", () => {
       await configureClientConfiguration(
         { name: "codex", configPath, format: "toml" },
         {},
-        ["/isolated prefix/bin/rea", "mcp"],
+        [PRODUCT_IDENTITY.cliBinary, "mcp"],
       ),
     ).toMatchObject({ status: "configured" });
     const configured = await readFile(configPath, "utf8");
@@ -1497,7 +1505,7 @@ describe("client configuration filesystem removal", () => {
       cursor,
       JSON.stringify({
         mcpServers: {
-          rea: { command: "/isolated prefix/bin/rea", args: ["mcp"] },
+          rea: { command: PRODUCT_IDENTITY.cliBinary, args: ["mcp"] },
           other: { command: "other" },
         },
       }),
@@ -1525,6 +1533,68 @@ describe("client configuration filesystem removal", () => {
       "complete",
     );
   });
+
+  it("removes emptied skill directories and keeps ones with user files", async () => {
+    const home = await createTestTempDirectory("rea-uninstall-skill-dirs-");
+    roots.push(home);
+    const shared = join(home, ".agents/skills/reverse-engineer-anything");
+    const claude = join(home, ".claude/skills/reverse-engineer-anything");
+    for (const root of [shared, claude]) {
+      await mkdir(join(root, "references"), { recursive: true });
+      await writeFile(join(root, "SKILL.md"), ownedSkillManifest);
+      await writeFile(
+        join(root, "references/evidence-workflows.md"),
+        "managed",
+      );
+    }
+    await writeFile(join(claude, "notes.md"), "user");
+
+    const result = await runUninstall(
+      false,
+      systemUninstallHost(home, undefined, {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: join(home, ".claude"),
+      }),
+    );
+
+    expect(result.status).toBe("complete");
+    await expect(lstat(shared)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(claude, "references"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFile(join(claude, "notes.md"), "utf8")).toBe("user");
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "reports an emptied skill directory that cannot be removed",
+    async () => {
+      const home = await createTestTempDirectory("rea-uninstall-skill-perm-");
+      roots.push(home);
+      const parent = join(home, ".agents/skills");
+      const root = join(parent, "reverse-engineer-anything");
+      await mkdir(join(root, "references"), { recursive: true });
+      await writeFile(join(root, "SKILL.md"), ownedSkillManifest);
+      await chmod(parent, 0o555);
+      try {
+        const result = await runUninstall(
+          false,
+          systemUninstallHost(home, undefined, { HOME: home }),
+        );
+        expect(result.status).toBe("failed");
+        expect(result.items).toContainEqual(
+          expect.objectContaining({
+            name: "skill",
+            status: "failed",
+            detail: expect.stringContaining(
+              `Managed skill directory could not be removed: ${root}.`,
+            ),
+          }),
+        );
+      } finally {
+        await chmod(parent, 0o755);
+      }
+    },
+  );
 
   it("removes an owned entry through a symlink without replacing it", async () => {
     const home = await createTestTempDirectory("rea-uninstall-symlink-");
@@ -1592,6 +1662,37 @@ describe("uninstall configuration preflight", () => {
     );
     expect(await readFile(config, "utf8")).toBe("not-json");
   });
+
+  it.each([
+    ['{"mcpServers":null,"keep":1}', '"mcpServers" must be an object'],
+    ["[]", "The configuration root must be an object"],
+    ['{"mcpServers":"x"}', '"mcpServers" must be an object'],
+  ])(
+    "names the structural problem in valid JSON %s",
+    async (content, problem) => {
+      const home = await createTestTempDirectory("rea-uninstall-shape-");
+      roots.push(home);
+      const config = join(home, ".cursor/mcp.json");
+      await mkdir(dirname(config), { recursive: true });
+      await writeFile(config, content);
+      expect(await readConfigurationFile(config, "json")).toMatchObject({
+        ok: false,
+        error: {
+          kind: "malformed",
+          detail: `Configuration ${config} is malformed: ${problem}`,
+        },
+      });
+      const result = await runUninstall(false, systemUninstallHost(home));
+      expect(result.status).toBe("failed");
+      expect(result.items).toContainEqual({
+        name: "cursor",
+        status: "failed",
+        detail: `Configuration was not changed: ${problem}. Repair it, then rerun uninstall.`,
+      });
+      expect(await readFile(config, "utf8")).toBe(content);
+      await expect(readFile(`${config}.rea.backup`, "utf8")).rejects.toThrow();
+    },
+  );
 
   it("stops before any removal when one client configuration is malformed", async () => {
     const home = await createTestTempDirectory("rea-uninstall-stop-");
@@ -1796,14 +1897,11 @@ describe("client configuration filesystem failure reporting", () => {
         remove: () => Promise.reject(new Error("SECRET removal failure")),
       }),
     );
-    expect(result.items).toContainEqual(
-      expect.objectContaining({
-        name: "skill",
-        status: "failed",
-        detail: expect.stringContaining(
-          `Managed file could not be removed: ${join(skillRoot, "SKILL.md")}`,
-        ),
-      }),
+    const skillItem = result.items.find(({ name }) => name === "skill");
+    expect(skillItem?.status).toBe("failed");
+    expect(skillItem?.detail).toContain(`shared (${skillRoot}): failed (`);
+    expect(skillItem?.detail).toContain(
+      `Managed file could not be removed: ${join(skillRoot, "SKILL.md")}`,
     );
     expect(JSON.stringify(result)).not.toContain("SECRET");
     expect(await readFile(join(skillRoot, "SKILL.md"), "utf8")).toBe(
@@ -1841,6 +1939,42 @@ describe("client configuration filesystem failure reporting", () => {
           "user-authored",
         );
       }),
+    );
+  });
+});
+
+describe("skill root client identifier labels", () => {
+  it("labels each retained or removed skill root by its client identifier", async () => {
+    const home = await createTestTempDirectory("rea-uninstall-skill-labels-");
+    roots.push(home);
+    const customClaudeDirectory = join(home, "claude-config");
+    const sharedRoot = join(home, ".agents/skills/reverse-engineer-anything");
+    const claudeRoot = join(
+      customClaudeDirectory,
+      "skills/reverse-engineer-anything",
+    );
+    await mkdir(sharedRoot, { recursive: true });
+    await mkdir(claudeRoot, { recursive: true });
+    await writeFile(
+      join(sharedRoot, "SKILL.md"),
+      "---\nname: another-skill\n---\n# Not REA-owned\n",
+    );
+    await writeFile(join(claudeRoot, "SKILL.md"), ownedSkillManifest);
+
+    const skillItem = await systemUninstallHost(home, testFileSystem, {
+      CLAUDE_CONFIG_DIR: customClaudeDirectory,
+    }).removeSkill();
+
+    expect(skillItem.name).toBe("skill");
+    expect(skillItem.detail).toContain(`shared (${sharedRoot}): retained (`);
+    expect(skillItem.detail).toContain(
+      `claude_code (${claudeRoot}): removed (`,
+    );
+    await expect(
+      readFile(join(claudeRoot, "SKILL.md"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(sharedRoot, "SKILL.md"), "utf8")).toContain(
+      "another-skill",
     );
   });
 });

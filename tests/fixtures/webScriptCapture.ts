@@ -19,6 +19,7 @@ export const scriptScenarioFixture = (
     const request = {
       transaction_id: `request-${index + 1}`,
       redirected_from_transaction_id: null,
+      redirected_from_transaction_state: "root",
       method: "GET",
       url: sanitizeBrowserUrl(url),
       resource_type: "script",
@@ -105,6 +106,7 @@ export const scriptScenarioFixture = (
         response_body: true,
         header_values: false,
       },
+      event_families: ["network"],
     },
     duration_ms: 2,
     steps: [step(0), step(1)],

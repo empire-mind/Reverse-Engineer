@@ -16,7 +16,10 @@ import type {
 } from "../application/AnalysisProvider.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import type { AppConfig } from "../config/types.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import {
+  isElfMetadataArchitecture,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { Logger } from "pino";
 import { AnalysisCapabilityUnavailableError } from "../domain/analysisErrorCore.js";
@@ -111,6 +114,14 @@ export class HopperProvider implements AnalysisProviderCandidate {
         reason: `Hopper cannot directly analyze ${target.kind} targets.`,
         diagnostics,
       };
+    if (target.kind === "database" && this.platform === "darwin")
+      return {
+        status: "unsupported",
+        code: "target_kind_unsupported",
+        reason:
+          "This Hopper macOS launcher cannot start REA's analysis bridge when opening a saved Hopper database. Open an executable target instead; saved-database analysis is unavailable until Hopper exposes a database launch route that runs the bridge script.",
+        diagnostics,
+      };
     if (target.kind === "database")
       return {
         status: "supported",
@@ -118,11 +129,17 @@ export class HopperProvider implements AnalysisProviderCandidate {
         reason: null,
         diagnostics,
       };
-    if (target.architecture === "mips")
+    if (isElfMetadataArchitecture(target.architecture))
       return {
         status: "unsupported",
         code: "architecture_unsupported",
-        reason: "REA's Hopper adapter does not admit MIPS targets.",
+        reason: `REA's Hopper adapter does not admit ${
+          target.architecture === "mips"
+            ? "MIPS"
+            : target.architecture === "riscv"
+              ? "RISC-V"
+              : "PowerPC"
+        } targets.`,
         diagnostics,
       };
     if (target.format === "raw-binary")
@@ -263,14 +280,15 @@ export class HopperProvider implements AnalysisProviderCandidate {
         rawResult,
         ...(profile === undefined ? {} : { analysisProfile: profile }),
         ...(operation === "procedure_callers" ||
-        operation === "procedure_callees"
+        operation === "procedure_callees" ||
+        operation === "analyze_function"
           ? { relationshipCoverage: { status: "complete" as const } }
           : {}),
         limitations: [
           ...(preparedImage === undefined
             ? []
             : [
-                "REA loaded a verified thin Mach-O slice from the original FAT64 source. Identity and file offsets refer to the original file. The owned temporary image and its Hopper document close together, including on MCP shutdown.",
+                "REA loaded a verified thin Mach-O slice from the original FAT source. Identity and file offsets refer to the original file. The owned temporary image and its Hopper document close together, including on MCP shutdown.",
               ]),
           ...(CAPABILITIES.find(
             (descriptor) => descriptor.operation === operation,

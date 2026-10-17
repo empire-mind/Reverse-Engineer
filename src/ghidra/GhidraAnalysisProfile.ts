@@ -15,8 +15,16 @@ import { err, ok, type Result } from "../domain/result.js";
 import type { GhidraInstallationInspection } from "./GhidraInstallation.js";
 import {
   ghidraMipsProfileParameters,
-  ghidraMipsSharedLanguageOverride,
+  ghidraMipsLanguageOverride,
 } from "./GhidraMipsProfile.js";
+import {
+  ghidraRiscvLanguageOverride,
+  ghidraRiscvProfileParameters,
+} from "./GhidraRiscvProfile.js";
+import {
+  ghidraPowerPcLanguage,
+  ghidraPowerPcProfileParameters,
+} from "./GhidraPowerPcProfile.js";
 import { ghidraRawBinaryLanguage } from "./GhidraRawBinaryLanguage.js";
 
 import {
@@ -31,6 +39,20 @@ import {
   NATIVE_AOT_MAX_WORK_UNITS,
   NATIVE_AOT_PROFILE_CONTRACT_REVISION,
 } from "../domain/native/nativeAotPe.js";
+
+const callRelationshipCoverage = "function-body-call-coverage-v5";
+
+/**
+ * The processor language REA pins for this target, or undefined when Ghidra may
+ * select from the header. The committed profile and the session readback both
+ * compare against this single owner rather than re-deriving a lane.
+ */
+export const ghidraPinnedLanguage = (
+  target: BinaryTarget,
+): GhidraLanguageOverride | undefined =>
+  ghidraMipsLanguageOverride(target) ??
+  ghidraRiscvLanguageOverride(target) ??
+  ghidraPowerPcLanguage(target);
 
 /** Resolve version-bound, deterministic semantics before Ghidra imports a target. */
 export const resolveGhidraAnalysisProfile = async (
@@ -105,12 +127,17 @@ export const resolveGhidraAnalysisProfile = async (
           load_image_observations: "source-mappings-entry-context-v2",
           function_body_evidence: "complete-inclusive-ranges-v1",
           function_references: "complete-body-and-entry-reference-manager-v2",
-          call_relationship_coverage: "resolved-call-reference-diagnostics-v1",
+          call_relationship_coverage: callRelationshipCoverage,
+          function_dossier_coverage:
+            "observed-facets-and-call-relationships-v1",
           string_inventory_evidence: "defined-data-coverage-v1",
           location_resolution: "explicit-address-exact-entry-symbol-first-v3",
+          procedure_file_offset_resolution:
+            "address-first-unique-target-source-mapping-v2",
           instruction_flow_evidence: "decoded-return-pcode-v1",
           instruction_references: "exact-address-incoming-v1",
-          function_boundary_observations: "ghidra-terminal-call-limitations-v1",
+          function_boundary_observations:
+            "ghidra-function-boundary-limitations-v3",
           no_return_repair:
             installation.platform === "win32"
               ? "disabled-windows-p0"
@@ -119,7 +146,7 @@ export const resolveGhidraAnalysisProfile = async (
             installation.platform === "win32"
               ? "official-headless-script-v1"
               : "inspected-jvm-launch-support-v1",
-          load_image_evidence: "independent-raw-mapping-context-v2",
+          load_image_evidence: "independent-raw-mapping-context-v4",
           jump_table_evidence: "typed-case-default-blocks-v1",
           decompiler_jump_loads: true,
           loader: "BinaryLoader",
@@ -136,22 +163,27 @@ export const resolveGhidraAnalysisProfile = async (
   const dosMz = target.format === "dos-mz";
   const dosCom = target.format === "dos-com";
   const dos = dosMz || dosCom;
-  const mipsLanguage = ghidraMipsSharedLanguageOverride(target);
+  const pinnedLanguage = ghidraPinnedLanguage(target);
   if (
-    mipsLanguage !== undefined &&
+    pinnedLanguage !== undefined &&
+    target.architecture !== "powerpc" &&
     languageOverride !== undefined &&
-    (languageOverride.languageId !== mipsLanguage.languageId ||
+    (languageOverride.languageId !== pinnedLanguage.languageId ||
       (languageOverride.compilerSpecId !== undefined &&
-        languageOverride.compilerSpecId !== mipsLanguage.compilerSpecId))
+        languageOverride.compilerSpecId !== pinnedLanguage.compilerSpecId))
   )
     return err(
       new AnalysisUnsupportedTargetError(
         "resolve_analysis_profile",
         target.path,
-        "The caller-selected processor or compiler specification is outside the verified endian-matched MIPS32 shared-image profile. The requested override has not been changed.",
+        `The caller-selected processor or compiler specification is outside the verified ${
+          target.architecture === "riscv"
+            ? "generic little-endian RISC-V"
+            : "endian-matched MIPS32"
+        } profile. The requested override has not been changed.`,
       ),
     );
-  const selectedLanguage = languageOverride ?? mipsLanguage;
+  const selectedLanguage = languageOverride ?? pinnedLanguage;
   // DOS imports already force an admitted loader, language, and context.
   if (dos && languageOverride !== undefined)
     return Promise.resolve(
@@ -186,16 +218,23 @@ export const resolveGhidraAnalysisProfile = async (
           ...(target.availableArchitectures ?? []),
         ].sort(),
         import_mode: "ephemeral-source-immutable",
+        ...(target.format === "pe"
+          ? { pdb_observations: "program-info-v1" }
+          : {}),
         annotation_policy: "atomic-function-entry-metadata-v1",
         load_image_observations: "source-mappings-entry-context-v2",
         function_body_evidence: "complete-inclusive-ranges-v1",
         function_references: "complete-body-and-entry-reference-manager-v2",
-        call_relationship_coverage: "resolved-call-reference-diagnostics-v1",
+        call_relationship_coverage: callRelationshipCoverage,
+        function_dossier_coverage: "observed-facets-and-call-relationships-v1",
         string_inventory_evidence: "defined-data-coverage-v1",
         location_resolution: "explicit-address-exact-entry-symbol-first-v3",
+        procedure_file_offset_resolution:
+          "address-first-unique-target-source-mapping-v2",
         instruction_flow_evidence: "decoded-return-pcode-v1",
         instruction_references: "exact-address-incoming-v1",
-        function_boundary_observations: "ghidra-terminal-call-limitations-v1",
+        function_boundary_observations:
+          "ghidra-function-boundary-limitations-v3",
         no_return_repair:
           installation.platform === "win32"
             ? "disabled-windows-p0"
@@ -227,7 +266,7 @@ export const resolveGhidraAnalysisProfile = async (
             ? "auto-default"
             : (selectedLanguage.compilerSpecId ?? "language-default"),
         ...(languageOverride === undefined
-          ? mipsLanguage === undefined
+          ? pinnedLanguage === undefined
             ? {}
             : { language_selection: "provider-pinned-v1" }
           : { language_selection: "configured-v1" }),
@@ -250,7 +289,9 @@ export const resolveGhidraAnalysisProfile = async (
             }
           : {}),
         ...analyzerParameters,
-        ...ghidraMipsProfileParameters(target),
+        ...ghidraMipsProfileParameters(target, languageOverride),
+        ...ghidraRiscvProfileParameters(target),
+        ...ghidraPowerPcProfileParameters(target),
         ...(pspExtension?.ok === true
           ? {
               mips_support_lane: "psp-elf32-exec-eabi32-allegrex-v2",

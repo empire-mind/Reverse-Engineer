@@ -13,6 +13,8 @@ export interface FakeCdpBrowser {
   readonly commands: readonly FakeCdpCommand[];
   /** Actual WebSocket connections still held by the wire fixture. */
   activeConnectionCount(): number;
+  /** WebSocket upgrades accepted over the fixture's lifetime. */
+  openedConnectionCount(): number;
   /** Deliver actual malformed wire data without bypassing the production transport parser. */
   emitRawMessage(message: string): void;
   emitEvent(event: {
@@ -105,6 +107,7 @@ export interface FakeOptions {
   readonly cachedResponseBody?: string;
   readonly invalidResponseBodyBase64?: boolean;
   readonly webMcpTools?: boolean;
+  readonly webMcpConsequential?: JsonValue;
   readonly webMcpSameUrlRegistrations?: "retain" | "remove-second";
   readonly webMcpFrameCount?: number;
   readonly webMcpSchemaPropertyCount?: number;

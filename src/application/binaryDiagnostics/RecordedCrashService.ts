@@ -10,6 +10,7 @@ import {
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import {
   inspectRecordedCrashInputSchema,
+  RECORDED_LINUX_CORE_PROFILES,
   recordedCrashSchema,
 } from "../../domain/native/recordedCrash.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
@@ -21,10 +22,36 @@ const OPERATION = "inspect_recorded_crash";
 export class RecordedCrashService {
   constructor(readonly provider: RecordedCrashPort) {}
 
+  close(): Promise<void> {
+    return this.provider.close?.() ?? Promise.resolve();
+  }
+
   /** Bind complete observations to the caller-selected artifact before creating Evidence. */
   async inspect(
     rawInput: unknown,
     options?: ExecutionOptions,
+  ): Promise<Result<Evidence, AnalysisError>> {
+    return this.#inspect(rawInput, options, (input) =>
+      this.provider.inspect(input, options),
+    );
+  }
+
+  /** Complete the owned one-shot lifecycle before validating and publishing Evidence. */
+  inspectAndClose(
+    rawInput: unknown,
+    options?: ExecutionOptions,
+  ): Promise<Result<Evidence, AnalysisError>> {
+    return this.#inspect(rawInput, options, (input) =>
+      this.provider.inspectAndClose(input, options),
+    );
+  }
+
+  async #inspect(
+    rawInput: unknown,
+    options: ExecutionOptions | undefined,
+    inspect: (
+      input: Parameters<RecordedCrashPort["inspect"]>[0],
+    ) => ReturnType<RecordedCrashPort["inspect"]>,
   ): Promise<Result<Evidence, AnalysisError>> {
     if (options?.signal?.aborted)
       return err(new AnalysisCancelledError(OPERATION));
@@ -45,7 +72,7 @@ export class RecordedCrashService {
           },
         ]),
       );
-    const inspected = await this.provider.inspect(input.data, options);
+    const inspected = await inspect(input.data);
     if (!inspected.ok) return inspected;
     const diagnostics = recordedCrashSchema.shape.diagnostics.safeParse(
       inspected.value.diagnostics,
@@ -75,7 +102,9 @@ export class RecordedCrashService {
         {
           path: value.artifact.path,
           format: "elf",
-          architecture: "x86_64",
+          architecture:
+            RECORDED_LINUX_CORE_PROFILES[value.architecture]
+              .evidenceArchitecture,
           sha256: value.artifact.sha256,
         },
         this.provider.identity,

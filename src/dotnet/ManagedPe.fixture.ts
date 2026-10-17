@@ -29,6 +29,16 @@ interface ManagedPeFixtureOptions {
   readonly moduleRowCount?: number;
   readonly assemblyRowCount?: number;
   readonly memberRefParentRaw?: number;
+  readonly memberRefName?: string;
+  readonly memberRefSignature?: Buffer;
+  /** Raw MethodDefOrRef coded values, one MethodSpec row each. */
+  readonly methodSpecMethods?: readonly number[];
+  /** Instantiation blob shared by every MethodSpec row. */
+  readonly methodSpecInstantiation?: Buffer;
+  /** TypeSpec signature blobs, one TypeSpec row each. */
+  readonly typeSpecSignatures?: readonly Buffer[];
+  /** Raw ResolutionScope coded value of the TypeRef row; null by default. */
+  readonly typeRefScopeRaw?: number;
   readonly mvid?: Buffer;
   readonly pinvoke?: {
     readonly importName?: string;
@@ -43,6 +53,8 @@ interface ManagedPeFixtureOptions {
   readonly targetFramework?: string | null;
   readonly typeName?: string;
   readonly typeNamespace?: string;
+  /** Raw #US stream bytes; omitted means the metadata has no #US stream. */
+  readonly userStringHeap?: Buffer;
   readonly virtualSectionSize?: number;
 }
 
@@ -174,10 +186,10 @@ const typeRefRow = (
   name: number,
   namespace: number,
   stringSize: MetadataIndexSize,
-  resolutionScopeSize: MetadataIndexSize,
+  resolutionScope: Buffer,
 ): Buffer =>
   Buffer.concat([
-    metadataIndex(0, resolutionScopeSize),
+    resolutionScope,
     metadataIndex(name, stringSize),
     metadataIndex(namespace, stringSize),
   ]);
@@ -406,6 +418,56 @@ const fixedStringAttributeBlob = (value: string): Buffer => {
   return Buffer.concat([Buffer.from([1, 0, bytes.length]), bytes, u16(0)]);
 };
 
+/**
+ * Lay out ECMA-335 #US items (compressed length, UTF-16LE, terminal flag byte)
+ * and return the `ldstr` token that names each value.
+ */
+// ECMA-335 II.24.2.4 terminal flag: 1 when a code unit has a high byte or a
+// low byte in 0x01-0x08, 0x0E-0x1F, 0x27, 0x2D, or 0x7F.
+const userStringFlag = (text: Buffer): number => {
+  for (let index = 0; index < text.length; index += 2) {
+    const unit = text.readUInt16LE(index);
+    if (
+      unit > 0xff ||
+      (unit >= 0x01 && unit <= 0x08) ||
+      (unit >= 0x0e && unit <= 0x1f) ||
+      unit === 0x27 ||
+      unit === 0x2d ||
+      unit === 0x7f
+    )
+      return 1;
+  }
+  return 0;
+};
+
+/** A #US heap whose items carry the ECMA-335 terminal flag, and their tokens. */
+export const fixtureUserStringHeap = (
+  values: readonly string[],
+): { readonly heap: Buffer; readonly tokens: readonly string[] } => {
+  const items: Buffer[] = [Buffer.from([0])];
+  const tokens: string[] = [];
+  let size = 1;
+  for (const value of values) {
+    const text = Buffer.from(value, "utf16le");
+    const length = text.length + 1;
+    if (length > 0x3fff)
+      throw new RangeError("Managed PE fixture user string is too long");
+    const prefix =
+      length < 0x80
+        ? Buffer.from([length])
+        : Buffer.from([0x80 | (length >> 8), length & 0xff]);
+    tokens.push(`0x70${size.toString(16).padStart(6, "0")}`);
+    const item = Buffer.concat([
+      prefix,
+      text,
+      Buffer.from([userStringFlag(text)]),
+    ]);
+    items.push(item);
+    size += item.length;
+  }
+  return { heap: Buffer.concat(items), tokens };
+};
+
 const metadataStreamHeader = (
   relativeOffset: number,
   size: number,
@@ -418,12 +480,28 @@ const metadataStreamHeader = (
 };
 
 const metadataRoot = (
-  tables: Buffer,
-  strings: Buffer,
-  guid: Buffer,
-  blob: Buffer,
+  {
+    tables,
+    strings,
+    guid,
+    blob,
+    userStrings,
+  }: {
+    readonly tables: Buffer;
+    readonly strings: Buffer;
+    readonly guid: Buffer;
+    readonly blob: Buffer;
+    readonly userStrings?: Buffer | undefined;
+  },
   tableStreamName: "#~" | "#-" = "#~",
 ): Buffer => {
+  const streams: readonly (readonly [string, Buffer])[] = [
+    [tableStreamName, tables],
+    ["#Strings", strings],
+    ...(userStrings === undefined ? [] : [["#US", userStrings] as const]),
+    ["#GUID", guid],
+    ["#Blob", blob],
+  ];
   const version = Buffer.from("v4.0.30319\0\0", "utf8");
   const header = Buffer.concat([
     u32(0x424a_5342),
@@ -433,34 +511,27 @@ const metadataRoot = (
     u32(version.length),
     version,
     u16(0),
-    u16(4),
+    u16(streams.length),
   ]);
-  const streamHeaderSize =
-    metadataStreamHeader(0, 0, tableStreamName).length +
-    metadataStreamHeader(0, 0, "#Strings").length +
-    metadataStreamHeader(0, 0, "#GUID").length +
-    metadataStreamHeader(0, 0, "#Blob").length;
+  const streamHeaderSize = streams.reduce(
+    (total, [name]) => total + metadataStreamHeader(0, 0, name).length,
+    0,
+  );
   let offset = align4(header.length + streamHeaderSize);
-  const tablesOffset = offset;
-  offset = align4(offset + tables.length);
-  const stringsOffset = offset;
-  offset = align4(offset + strings.length);
-  const guidOffset = offset;
-  offset = align4(offset + guid.length);
-  const blobOffset = offset;
-  const headers = Buffer.concat([
-    metadataStreamHeader(tablesOffset, tables.length, tableStreamName),
-    metadataStreamHeader(stringsOffset, strings.length, "#Strings"),
-    metadataStreamHeader(guidOffset, guid.length, "#GUID"),
-    metadataStreamHeader(blobOffset, blob.length, "#Blob"),
-  ]);
-  const root = Buffer.alloc(align4(blobOffset + blob.length));
+  const placed = streams.map(([name, data]) => {
+    const at = offset;
+    offset = align4(offset + data.length);
+    return { name, data, at };
+  });
+  const headers = Buffer.concat(
+    placed.map(({ name, data, at }) =>
+      metadataStreamHeader(at, data.length, name),
+    ),
+  );
+  const root = Buffer.alloc(offset);
   header.copy(root, 0);
   headers.copy(root, header.length);
-  tables.copy(root, tablesOffset);
-  strings.copy(root, stringsOffset);
-  guid.copy(root, guidOffset);
-  blob.copy(root, blobOffset);
+  for (const { data, at } of placed) data.copy(root, at);
   return root;
 };
 
@@ -524,6 +595,8 @@ interface FixtureMetadataRowContext {
     readonly methodSignature: number;
     readonly constructorSignature: number;
     readonly attributeBlob: number;
+    readonly typeSpecSignatures: readonly number[];
+    readonly methodSpecInstantiation: number;
   };
   readonly heapSizes: {
     readonly strings: MetadataIndexSize;
@@ -595,6 +668,37 @@ const exportedTypeTable = (
         ],
       ];
 
+const specTables = (
+  options: ManagedPeFixtureOptions,
+  indexes: FixtureMetadataRowContext["indexes"],
+  heapSizes: FixtureMetadataRowContext["heapSizes"],
+  widths: FixtureIndexWidths,
+): readonly (readonly [number, readonly Buffer[]])[] => [
+  ...(indexes.typeSpecSignatures.length === 0
+    ? []
+    : ([
+        [
+          27,
+          indexes.typeSpecSignatures.map((signature) =>
+            metadataIndex(signature, heapSizes.blobs),
+          ),
+        ],
+      ] as const)),
+  ...(options.methodSpecMethods === undefined
+    ? []
+    : ([
+        [
+          43,
+          options.methodSpecMethods.map((method) =>
+            Buffer.concat([
+              metadataIndex(method, widths.coded([6, 10], 1)),
+              metadataIndex(indexes.methodSpecInstantiation, heapSizes.blobs),
+            ]),
+          ),
+        ],
+      ] as const)),
+];
+
 const fixtureIndexWidths = ({
   options,
   referenceStringIndexes,
@@ -616,10 +720,12 @@ const fixtureIndexWidths = ({
     ],
     ...(indexes.pinvokeModuleName === null ? [] : ([[26, 1]] as const)),
     ...(indexes.pinvokeImportName === null ? [] : ([[28, 1]] as const)),
+    [27, indexes.typeSpecSignatures.length],
     [32, options.assemblyRowCount ?? 1],
     [35, referenceStringIndexes.length],
     [39, indexes.exportedTypes.length],
     [40, 1],
+    [43, options.methodSpecMethods?.length ?? 0],
   ]);
   const count = (table: number): number => rowCounts.get(table) ?? 0;
   const table = (index: number): MetadataIndexSize => indexSize(count(index));
@@ -673,7 +779,7 @@ const fixtureMetadataRows = ({
           indexes.attributeName,
           indexes.attributeNamespace,
           heapSizes.strings,
-          widths.resolutionScope,
+          metadataIndex(options.typeRefScopeRaw ?? 0, widths.resolutionScope),
         ),
       ],
     ],
@@ -780,6 +886,7 @@ const fixtureMetadataRows = ({
       ),
     ],
     ...exportedTypeTable(options, indexes, heapSizes, widths),
+    ...specTables(options, indexes, heapSizes, widths),
     [
       40,
       [
@@ -795,6 +902,29 @@ const fixtureMetadataRows = ({
   return rows;
 };
 
+/** Blob indexes for the MemberRef and optional spec rows; defaults leave the heap unchanged. */
+const referenceBlobIndexes = (
+  blobs: BlobHeap,
+  options: ManagedPeFixtureOptions,
+): Pick<
+  FixtureMetadataRowContext["indexes"],
+  "constructorSignature" | "typeSpecSignatures" | "methodSpecInstantiation"
+> => ({
+  constructorSignature: blobs.add(
+    options.memberRefSignature ?? Buffer.from([0x20, 0x01, 0x01, 0x0e]),
+  ),
+  typeSpecSignatures: (options.typeSpecSignatures ?? []).map((signature) =>
+    blobs.add(signature),
+  ),
+  // Defaults to GENERICINST with one string type argument.
+  methodSpecInstantiation:
+    options.methodSpecMethods === undefined
+      ? 0
+      : blobs.add(
+          options.methodSpecInstantiation ?? Buffer.from([0x0a, 0x01, 0x0e]),
+        ),
+});
+
 const buildManagedFixtureMetadata = (
   options: ManagedPeFixtureOptions,
   methodRva: number,
@@ -805,7 +935,7 @@ const buildManagedFixtureMetadata = (
   const assemblyName = strings.add("Fixture.Managed");
   const attributeName = strings.add("TargetFrameworkAttribute");
   const attributeNamespace = strings.add("System.Runtime.Versioning");
-  const constructorName = strings.add(".ctor");
+  const constructorName = strings.add(options.memberRefName ?? ".ctor");
   const typeName = strings.add(options.typeName ?? "Program");
   const additionalTypeNames = Array.from(
     { length: options.additionalEmptyTypes ?? 0 },
@@ -840,7 +970,7 @@ const buildManagedFixtureMetadata = (
   const methodSignature = blobs.add(
     options.methodSignature ?? Buffer.from([0x00, 0x00, 0x01]),
   );
-  const constructorSignature = blobs.add(Buffer.from([0x20, 0x01, 0x01, 0x0e]));
+  const referenceBlobs = referenceBlobIndexes(blobs, options);
   const attributeBlob = blobs.add(
     fixedStringAttributeBlob(
       options.targetFramework === null
@@ -873,8 +1003,8 @@ const buildManagedFixtureMetadata = (
       tokenBlob,
       fieldSignature,
       methodSignature,
-      constructorSignature,
       attributeBlob,
+      ...referenceBlobs,
     },
     heapSizes: { strings: stringSize, blobs: blobSize, guids: guidSize },
   });
@@ -882,17 +1012,18 @@ const buildManagedFixtureMetadata = (
     (stringSize === 4 ? 0x01 : 0) |
     (guidSize === 4 ? 0x02 : 0) |
     (blobSize === 4 ? 0x04 : 0);
-  const metadata = metadataRoot(
-    tablesStream(
+  const metadata = metadataRoot({
+    tables: tablesStream(
       rows,
       options.metadataValidMaskExtra ?? 0n,
       heapFlags,
       options.metadataExtraData,
     ),
-    strings.toBuffer(),
-    guidHeap(options.mvid),
-    blobs.toBuffer(),
-  );
+    strings: strings.toBuffer(),
+    guid: guidHeap(options.mvid),
+    blob: blobs.toBuffer(),
+    userStrings: options.userStringHeap,
+  });
   if (options.corruptMetadataSignature === true) metadata.writeUInt32LE(0, 0);
   return metadata;
 };
@@ -1120,10 +1251,12 @@ export const buildManagedMemberPointerFixture = (
     if (fieldPointers !== null) rows.set(3, fieldPointers.map(u16));
     if (methodPointers !== null) rows.set(5, methodPointers.map(u16));
     return metadataRoot(
-      tablesStream(rows, 0n, 0),
-      strings.toBuffer(),
-      guidHeap(),
-      blobs.toBuffer(),
+      {
+        tables: tablesStream(rows, 0n, 0),
+        strings: strings.toBuffer(),
+        guid: guidHeap(),
+        blob: blobs.toBuffer(),
+      },
       options.streamName ?? "#-",
     );
   });

@@ -4,12 +4,12 @@ import type {
   JavaScriptSemanticCallable,
   JavaScriptSemanticObjectOperation,
 } from "./javascriptSemanticIr.js";
-import {
-  semanticCallableIdForNode,
-  semanticReadsBeforeWrite,
-} from "./javascriptSemanticProjection.js";
+import { createSemanticCallableIdStack } from "./javascriptSemanticCallableStack.js";
 import {
   semanticStaticPropertyKey,
+  semanticWriteSiteReadsFirst,
+  semanticWriteSiteTarget,
+  semanticWriteTargets,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
@@ -27,14 +27,20 @@ export const collectJavaScriptSemanticObjects = (
 ): JavaScriptSemanticObjectOperation[] => {
   const output: JavaScriptSemanticObjectOperation[] = [];
   const callableIds = new Set(callables.map(({ callableId }) => callableId));
-  const callableStack: string[] = [];
-  const context: ObjectCollectionContext = { state, output };
+  const callableStack = createSemanticCallableIdStack(callableIds);
+  const context: ObjectCollectionContext = {
+    state,
+    output,
+    writeTargets: new Map(),
+  };
   traverseJavaScriptAst(program, {
     enter: (node, parent) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null && callableIds.has(callableId))
-        callableStack.push(callableId);
-      const ownerCallableId = callableStack.at(-1) ?? null;
+      callableStack.enter(node, parent);
+      const ownerCallableId = callableStack.callables.at(-1) ?? null;
+      const writeTarget = semanticWriteSiteTarget(node);
+      if (writeTarget !== null)
+        for (const leaf of semanticWriteTargets(writeTarget))
+          if (!t.isIdentifier(leaf)) context.writeTargets.set(leaf, node);
       if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))
         collectMember(node, parent, ownerCallableId, context);
       else if (
@@ -61,11 +67,7 @@ export const collectJavaScriptSemanticObjects = (
       )
         collectDestructuring(node, ownerCallableId, state, output);
     },
-    exit: (node) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null && callableStack.at(-1) === callableId)
-        callableStack.pop();
-    },
+    exit: (node) => callableStack.exit(node),
   });
   return output;
 };
@@ -73,6 +75,7 @@ export const collectJavaScriptSemanticObjects = (
 interface ObjectCollectionContext {
   readonly state: JavaScriptSemanticAnalysisState;
   readonly output: JavaScriptSemanticObjectOperation[];
+  readonly writeTargets: Map<t.Node, t.Node>;
 }
 
 const collectMember = (
@@ -90,10 +93,11 @@ const collectMember = (
   )
     return;
   const identity = expressionObjectIdentity(node, state);
-  const write =
-    (t.isAssignmentExpression(parent) && parent.left === node) ||
-    (t.isUpdateExpression(parent) && parent.argument === node);
-  const readsBeforeWrite = write && semanticReadsBeforeWrite(node, parent);
+  const writeSite = context.writeTargets.get(node);
+  context.writeTargets.delete(node);
+  const write = writeSite !== undefined;
+  const readsBeforeWrite =
+    writeSite !== undefined && semanticWriteSiteReadsFirst(writeSite);
   if (readsBeforeWrite)
     addObjectOperation(
       {

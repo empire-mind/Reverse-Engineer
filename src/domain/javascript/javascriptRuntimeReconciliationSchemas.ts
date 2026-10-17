@@ -1,11 +1,13 @@
 import { z } from "zod";
 
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import { logicalPathEscapesRoot } from "../artifactIdentity.js";
 import { evidenceSchema } from "../evidence.js";
 import { javascriptRuntimeUnresolvedLocationSchema } from "./javascriptRuntimeObservation.js";
 import { javascriptApplicationGraphSchema } from "./javascriptApplicationGraph.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
+import { urlDeclaresQueryOrFragment } from "../urlComponents.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
 const nodeIdSchema = prefixedDigestSchema("jag_node");
@@ -15,8 +17,7 @@ const safePrefixSchema = z
   .refine(
     (value) =>
       value === "" ||
-      (!value.startsWith("/") &&
-        !value.includes("\\") &&
+      (!logicalPathEscapesRoot(value) &&
         value.split("/").every((part) => !["", ".", ".."].includes(part))),
     "Artifact prefix must be empty or a safe relative POSIX path",
   );
@@ -53,8 +54,7 @@ const normalizeRuntimeUrlPrefix = (value: string): string | null => {
     !["http:", "https:"].includes(url.protocol) ||
     url.username !== "" ||
     url.password !== "" ||
-    url.search !== "" ||
-    url.hash !== ""
+    urlDeclaresQueryOrFragment(url)
   )
     return null;
   if (!url.pathname.endsWith("/")) url.pathname += "/";
@@ -228,6 +228,7 @@ const staticLoadStateSchema = z.strictObject({
     "not-observed-in-bounded-capture",
     "layer-outside-runtime-scope",
     "static-or-runtime-coverage-incomplete",
+    "ambiguous-runtime-candidate",
   ]),
 });
 

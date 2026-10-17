@@ -62,6 +62,14 @@ unpack .NET single-file hosts or decode IL2CPP metadata. NativeAOT method bodies
 require native analysis. See the [managed-code guide](managed-code-analysis.md)
 for supported deployment forms, selection semantics, and coverage limits.
 
+## SQLite snapshots
+
+For a local database snapshot, use `rea inspect-sqlite-database PATH --json`.
+Add `--table NAME --row-limit 20` to read a bounded sample from an ordinary
+table. This command does not require a native analysis provider. See
+[SQLite database snapshots](sqlite-databases.md) for database/WAL identity,
+source-file handling and row-value semantics.
+
 ## Native analysis
 
 Inspect embedded Go build metadata without installing Go or configuring a
@@ -74,6 +82,18 @@ rea inspect-go-binary /absolute/path/to/program --json
 The shared CLI/MCP workflow reports compiler version, modules, replacements,
 build settings, original bytes and SHA-256. See [Go binaries](go-binaries.md)
 for supported containers and absent or malformed metadata.
+
+Inspect an embedded cargo-auditable Rust dependency list without installing
+Rust or configuring a disassembler:
+
+```bash
+rea inspect-rust-binary /absolute/path/to/program --json
+```
+
+The same workflow reports package names, versions, sources, the root package,
+dependency edges, and the section's file range. A missing `.dep-v0` section is
+null metadata, not proof that the binary has no dependencies. See
+[Rust binaries](rust-binaries.md).
 
 Configure [Hopper or Ghidra](installation.md#hopper), or the
 [IDA adapter](ida-provider.md), before analyzing a native target. Substitute
@@ -93,7 +113,7 @@ a function dossier; `decompile` returns pseudocode. For assembly instructions
 alone, use `rea instructions`. A macOS `.app` bundle can be supplied directly.
 
 Run `rea --help` or a command's `--help` for arguments and output options.
-The [generated catalog](product-catalog.json) lists all CLI commands and MCP
+The [generated catalog](mcp-contracts.md#generated-catalog) lists all CLI commands and MCP
 tools. Provider-specific target support is described in the
 [native guide](native-investigation.md), [DOS guide](ghidra-dos.md),
 [raw binary guide](raw-binary.md), and
@@ -132,9 +152,13 @@ overrides it. In MCP, pass `provider_id` to `open_binary`:
 The selected provider remains bound to the session until an explicit switch
 or close. Provider failures are returned with their original reason. For an
 `ambiguous` selection error, choose from `details.candidate_ids`; for
-`provider_unavailable`, run `rea doctor --provider ID --json` to diagnose the
-selected engine. See [task readiness](installation.md#check-readiness-for-your-task)
-and [provider selection](mcp-contracts.md#identity-and-discovery).
+`provider_unavailable`, follow `message`, `remediation.action`, and the original
+reasons in `details.rejections`. For Hopper, Ghidra, IDA, and JADX, run
+`rea doctor --provider ID --json` to diagnose the selected engine. Other adapters,
+such as `pwntools-elf`, report their configuration requirements directly and are
+not accepted by `doctor --provider`. See
+[task readiness](installation.md#check-readiness-for-your-task) and
+[provider selection](mcp-contracts.md#identity-and-discovery).
 
 The session reports work still in progress through `analysis_activity`.
 A client timeout can end its wait while the provider continues analyzing.
@@ -166,7 +190,9 @@ rea analyze /absolute/path/to/program --provider ghidra --snapshot /absolute/pat
 rea analyze /absolute/path/to/program --provider ghidra --snapshot /absolute/path/to/analysis/program.json
 ```
 
-An exact CLI cache hit is read before starting a provider process.
+An exact CLI cache hit is normally read before starting a provider process.
+On Windows, Ghidra first admits the selected source through its native snapshot
+owner, so replay can start that provider.
 In MCP, `open_binary` accepts `snapshot_path` to import a snapshot atomically
 for its matching target; an MCP provider may still start before returning a
 cached result. `close_binary` accepts `snapshot_path` and optional
@@ -204,14 +230,49 @@ Import an older source tree to compare with the current artifact:
 
 ```bash
 rea import-reference-source /absolute/path/to/source
+rea import-reference-source /absolute/path/to/source --detail summary --outline-depth 2 --json
 ```
 
+The default (`--detail full`) returns the complete `HistoricalSourceGraph`.
+Choose `--detail summary` for a `HistoricalSourceSummary` of that same committed
+inventory: its `HistoricalSourceManifest` contains the full graph and root
+digests, with provenance, VCS facts, languages, manifest paths, entry and
+relationship counts, parse-failure counts, file/directory states, exclusions
+and limitations. The summary is a presentation view, not a graph accepted by
+source-to-bundle comparison; keep the full output for that workflow.
+
+`--outline-depth` requires `--detail summary` and accepts a nonnegative safe
+integer. Depth 1 shows root children, depth 2 (the default) also shows their
+children, and depth 0 omits all outline entries. Paths retain canonical Unicode
+code-point order. `outline.omitted_entry_count` counts only inventoried entries
+hidden by the chosen depth; it does not count unexamined children of excluded or
+unreadable directories, or change `inventory_state`. Exclusions and source
+limitations remain separate from this presentation omission.
+
+`file_sizes.known_bytes` is the exact sum of known inventoried file sizes as
+decimal text, so large sums cannot lose integer precision. Unknown sizes count
+in `file_sizes.unknown_file_count`; excluded or unexamined paths are not included
+in that total. A zero known-byte sum therefore does not establish an empty source
+tree. Full output retains individual file hashes, relationships and parse-failure
+diagnostics. Summary mode performs the same import and cleanup, then projects
+the committed result without rereading source files. It reduces the selected
+output, not the amount of source examined. A shallow tree or many exclusions can
+still produce a large summary; depth 0 removes the outline but preserves the
+other facts. No fixed output-size or runtime improvement is promised.
+
 The import records hashes and metadata for the supplied files, separately
-from observations of the current app. It honors the source tree's `.gitignore`
+from observations of the current app. For a directory inside a Git checkout,
+it records the HEAD of the nearest enclosing repository; whether the working
+tree matches that commit remains unknown. It honors the source tree's `.gitignore`
 and applies default exclusions for common generated and dependency paths such
 as `node_modules/`, `dist/`, and `*.log`. Pattern-based exclusions record the
 matched pattern and whether it came from project, default, caller, or sensitive
-path policy. Set `REA_REFERENCE_SECRET_PATTERNS_JSON` to a JSON array of ignore
+path policy. Links into excluded paths retain their internal target metadata;
+the exclusion explains why the target has no inventory entry, and the inventory
+remains partial. Exclusions record `entry_kind` when the importer observed it;
+older saved exclusions without that field have unknown kind. An excluded
+ancestor proves an internal descendant only when its kind is `directory`.
+Set `REA_REFERENCE_SECRET_PATTERNS_JSON` to a JSON array of ignore
 patterns when you want to mark selected paths as sensitive; those patterns are
 reported separately as configured-secret exclusions.
 
@@ -235,6 +296,7 @@ Choose the guide for the target and intended interaction:
 - [Browser observation](browser-observation.md): inspect a selected page through CDP.
 - [Browser scenarios](browser-scenario-contract.md): run declared interactions and capture their results.
 - [Electron observation](electron-observation.md): inspect an Electron renderer or capture an application scenario.
+- [Electron fuses](electron-fuses.md): read packaged fuse bytes before expecting `--inspect` to reach an Electron main process.
 - [Node/Electron Inspector](javascript-runtime-observation.md): record script locations and execution contexts.
 - [Process capture](process-capture.md): run an executable and compare terminal, exit and filesystem observations.
 
@@ -242,6 +304,14 @@ Runtime requests name the target and actions. Launched targets run with your
 user permissions; consult the chosen guide for host requirements and effects.
 
 ## Output and exit status
+
+`rea mcp doctor --json` checks production MCP startup and reports child logs in
+`diagnostics`. It drains stderr while retaining at most its first 64 KiB of raw
+bytes as text, omitting a final UTF-8 code point if it crosses that byte limit.
+`stderr_bytes` counts all observed bytes, including omitted output;
+`stderr_truncated` indicates that output exceeded the retention limit. The same
+diagnostics appear inside the report when `--full-output` is selected. Log
+truncation alone does not change the diagnostic health or exit status.
 
 The default terminal format is TOON. Use `--json` when saving results for a
 JSON consumer. `--json` is indented on a terminal and compact when piped or

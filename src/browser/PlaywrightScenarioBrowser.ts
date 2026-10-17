@@ -11,6 +11,9 @@ import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { withPlaywrightExecutionBoundary } from "./PlaywrightExecutionBoundary.js";
 
 const OPERATION = "capture_browser_scenario" as const;
+// Closing a real Chrome persistent context can take several seconds even when
+// it succeeds. The shorter operation deadline must not misreport cleanup.
+const CLEANUP_CONFIRMATION_TIMEOUT_MS = 30_000;
 
 const throwIfScenarioCancelled = (signal: AbortSignal | undefined): void => {
   if (signal?.aborted === true)
@@ -48,10 +51,7 @@ export class PlaywrightScenarioBrowserCleanupOwner {
     return this.#browserClosed;
   }
 
-  close(
-    finishEvents?: () => Promise<void>,
-    signal?: AbortSignal,
-  ): Promise<void> {
+  close(finishEvents?: () => Promise<void>): Promise<void> {
     const cleanup = this.#closePromise ?? this.#closeResources(finishEvents);
     if (this.#closePromise === undefined) {
       this.#closePromise = cleanup;
@@ -63,15 +63,15 @@ export class PlaywrightScenarioBrowserCleanupOwner {
         },
       );
     }
-    return this.#awaitCleanup(cleanup, signal);
+    return this.#awaitCleanup(cleanup);
   }
 
-  async #awaitCleanup(
-    cleanup: Promise<void>,
-    signal?: AbortSignal,
-  ): Promise<void> {
+  async #awaitCleanup(cleanup: Promise<void>): Promise<void> {
     try {
-      await withPlaywrightExecutionBoundary(() => cleanup, 1_000, signal);
+      await withPlaywrightExecutionBoundary(
+        () => cleanup,
+        CLEANUP_CONFIRMATION_TIMEOUT_MS,
+      );
     } catch (cause: unknown) {
       throw new BrowserObservationError(OPERATION, "cleanup_failed", {
         cause,

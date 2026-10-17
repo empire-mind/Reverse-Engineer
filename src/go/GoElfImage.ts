@@ -1,36 +1,26 @@
 import {
+  declaredFileRange,
   GoBinaryFormatFailure,
   GoBinaryReader,
   mappedFileOffset,
   type GoBinaryContainer,
   type GoFileMapping,
+  type GoImageSection,
   type GoZeroFillMapping,
 } from "./GoBinaryContainer.js";
+import { readElfFixedHeader } from "../domain/elfFixedHeader.js";
 
 /** Read ELF build-info sections and file-backed program mappings. */
 export const readGoElfImage = (bytes: Buffer): GoBinaryContainer => {
-  if (bytes.length < 16)
-    throw new GoBinaryFormatFailure(
-      "malformed",
-      "ELF identification is truncated",
-    );
-  const bits = bytes[4] === 1 ? 32 : bytes[4] === 2 ? 64 : null;
-  if (bits === null || ![1, 2].includes(bytes[5] ?? 0) || bytes[6] !== 1)
-    throw new GoBinaryFormatFailure(
-      "malformed",
-      "ELF class, byte order, or version is invalid",
-    );
-  const reader = new GoBinaryReader(bytes, bytes[5] === 1);
+  const fixedHeader = readElfFixedHeader(bytes);
+  if (!fixedHeader.ok)
+    throw new GoBinaryFormatFailure("malformed", fixedHeader.error);
+  const { elfClass: bits, headerSize } = fixedHeader.value;
+  const reader = new GoBinaryReader(
+    bytes,
+    fixedHeader.value.byteOrder === "little",
+  );
   const wide = bits === 64;
-  const minimum = wide ? 64 : 52;
-  reader.range(0, minimum, "ELF header");
-  if (reader.u32(20) !== 1 || reader.u16(wide ? 52 : 40) < minimum)
-    throw new GoBinaryFormatFailure(
-      "malformed",
-      "ELF header version or size is invalid",
-    );
-  const headerSize = reader.u16(wide ? 52 : 40);
-  reader.range(0, headerSize, "ELF declared header");
   const phOffset = reader.word(wide ? 32 : 28, bits);
   const shOffset = reader.word(wide ? 40 : 32, bits);
   const phWidth = reader.u16(wide ? 54 : 42);
@@ -112,7 +102,8 @@ export const readGoElfImage = (bytes: Buffer): GoBinaryContainer => {
   );
   const mappings: GoFileMapping[] = [];
   const zeroFills: GoZeroFillMapping[] = [];
-  let fallback: GoFileMapping | null = null;
+  const sections: GoImageSection[] = [];
+  const fallback: GoFileMapping[] = [];
   for (let index = 0; index < phCount; index++) {
     const offset = phStart + index * phWidth;
     if (reader.u32(offset) !== 1) continue;
@@ -135,7 +126,7 @@ export const readGoElfImage = (bytes: Buffer): GoBinaryContainer => {
     if (mapping.size !== 0) mappings.push(mapping);
     if (memorySize > size)
       zeroFills.push({ address: address + size, size: memorySize - size });
-    if (fallback === null && (flags & 3) === 2) fallback = mapping;
+    if (mapping.size !== 0 && (flags & 3) === 2) fallback.push(mapping);
   }
   let search: GoFileMapping | null = null;
   if (shCount !== 0) {
@@ -170,6 +161,15 @@ export const readGoElfImage = (bytes: Buffer): GoBinaryContainer => {
             "malformed",
             "ELF section name offset is outside its string table",
           );
+        recordElfSection(sections, {
+          bytes,
+          names,
+          nameOffset,
+          reader,
+          bits,
+          wide,
+          header: offset,
+        });
         // Comparing the complete fixed name avoids quadratic scans through malicious string tables.
         const expectedName = Buffer.from(".go.buildinfo\0");
         if (
@@ -225,9 +225,104 @@ export const readGoElfImage = (bytes: Buffer): GoBinaryContainer => {
     byte_order: reader.little ? "little" : "big",
     mappings,
     zero_fills: zeroFills,
-    search: search ?? fallback,
+    sections,
+    search: search === null ? fallback : [search],
   };
 };
+
+const recordElfSection = (
+  sections: GoImageSection[],
+  input: {
+    readonly bytes: Buffer;
+    readonly names: { readonly offset: number; readonly size: number };
+    readonly nameOffset: number;
+    readonly reader: GoBinaryReader;
+    readonly bits: 32 | 64;
+    readonly wide: boolean;
+    readonly header: number;
+  },
+): void => {
+  const decoded = elfSectionName(input.bytes, input.names, input.nameOffset);
+  const header = {
+    reader: input.reader,
+    bits: input.bits,
+    wide: input.wide,
+    header: input.header,
+  };
+  switch (decoded.status) {
+    case "named":
+      sections.push(elfImageSection({ ...header, name: decoded.name }));
+      return;
+    case "truncated": {
+      // Names past this window stay out of .dep-v0 matching. Read-only
+      // bytes can still hold the only compiler path.
+      const section = elfImageSection({ ...header, name: "" });
+      if (section.read_only) sections.push(section);
+      return;
+    }
+    case "unnamed":
+      return;
+    default: {
+      const unreachable: never = decoded;
+      return unreachable;
+    }
+  }
+};
+
+const elfSectionName = (
+  bytes: Buffer,
+  names: { readonly offset: number; readonly size: number },
+  nameOffset: number,
+):
+  | { readonly status: "named"; readonly name: string }
+  | { readonly status: "unnamed" }
+  | { readonly status: "truncated" } => {
+  const start = names.offset + nameOffset;
+  const limit = Math.min(start + 64, names.offset + names.size);
+  const nul = bytes.subarray(start, limit).indexOf(0);
+  if (nul === 0) return { status: "unnamed" };
+  if (nul < 0) return { status: "truncated" };
+  return {
+    status: "named",
+    name: bytes.toString("latin1", start, start + nul),
+  };
+};
+
+const elfImageSection = ({
+  reader,
+  bits,
+  wide,
+  header,
+  name,
+}: {
+  readonly reader: GoBinaryReader;
+  readonly bits: 32 | 64;
+  readonly wide: boolean;
+  readonly header: number;
+  readonly name: string;
+}): GoImageSection => {
+  const type = reader.u32(header + 4);
+  const flags = reader.word(header + 8, bits);
+  const declared = declaredFileRange(
+    reader.bytes.length,
+    reader.word(header + (wide ? 24 : 16), bits),
+    reader.word(header + (wide ? 32 : 20), bits),
+  );
+  // SHT_NOBITS offsets and sizes do not describe stored bytes.
+  const range =
+    type === SHT_NOBITS ? { ...declared, file_backed: false } : declared;
+  const compressed = (flags & 0x800n) !== 0n;
+  const readOnly =
+    type === 1 &&
+    range.file_backed &&
+    !compressed &&
+    (flags & 1n) === 0n &&
+    (flags & 4n) === 0n &&
+    (flags & 2n) !== 0n;
+  return { name, ...range, read_only: readOnly, compressed };
+};
+
+const SHT_NOBITS = 8;
 
 const elfArchitecture = (machine: number): string => {
   const names = new Map([

@@ -3,17 +3,28 @@ import { javaScriptSourceSelectionSchema } from "../javascript/javascriptSourceS
 
 import {
   AnalysisInputError,
-  type AnalysisInputIssue,
   AnalysisUnsupportedTargetError,
 } from "../analysisErrorCore.js";
+import {
+  INSPECT_ANALYSIS_VIEW_OPERATION,
+  analysisViewInputError,
+} from "./analysisViewErrors.js";
 import { digestCanonicalValue } from "../canonicalDigest.js";
 import { digestSchema, prefixedDigestSchema } from "../digests.js";
-import { evidenceSchema } from "../evidence.js";
+import { evidenceSchema, type Evidence } from "../evidence.js";
 import { jsonObjectSchema, jsonValueSchema } from "../jsonValue.js";
 import { err, ok, type Result } from "../result.js";
 import type { AnalysisError } from "../analysisErrorBase.js";
 import { binaryLayoutSchema } from "../native/binaryLayout.js";
 import { functionDossierSchema } from "../hopperValues.js";
+import {
+  artifactGraphManifestSchema,
+  artifactNodeSchema,
+  artifactOccurrenceSchema,
+  artifactEdgeSchema,
+  integrityContradictionSchema,
+} from "../artifactGraph.js";
+import { artifactInspectionResultSchema } from "../artifactInspection.js";
 import {
   parseOwnedJavaScriptApplicationAnalysisSteps,
   type JavaScriptApplicationAnalysisResult,
@@ -27,10 +38,77 @@ import {
   apiSurfaceViewSchema,
 } from "./webNetworkApiSurfaceView.js";
 import { projectNativeFunctionView } from "./nativeFunctionView.js";
+import {
+  projectEvmInterfaceView,
+  evmViewRequestSchema,
+  evmViewItemSchema,
+  evmSummarySchema,
+} from "./evmInterfaceView.js";
+import { projectArtifactInventoryView } from "./artifactInventoryView.js";
+import {
+  projectManagedArtifactView,
+  managedViewRequestSchema,
+  managedViewItemSchema,
+  managedSummarySchema,
+  managedViewContextSchema,
+} from "./managedArtifactView.js";
+import {
+  projectManagedMemberView,
+  managedMembersViewRequestSchema,
+  managedMembersViewPageSchema,
+  managedMemberSummarySchema,
+  managedMembersViewContextSchema,
+} from "./managedMemberView.js";
+import {
+  projectWasmArtifactView,
+  wasmViewRequestSchema,
+  wasmViewItemSchema,
+  wasmSummarySchema,
+} from "./wasmArtifactView.js";
+import {
+  machoSummarySchema,
+  machoViewContextSchema,
+  machoViewItemSchema,
+  machoViewRequestSchema,
+  projectMachoView,
+} from "./machoView.js";
+import {
+  interfaceBuilderSummarySchema,
+  interfaceBuilderViewContextSchema,
+  interfaceBuilderViewItemsSchema,
+  interfaceBuilderViewRequestSchema,
+  projectInterfaceBuilderView,
+} from "./interfaceBuilderView.js";
+import {
+  projectWebNetworkCaptureView,
+  captureViewRequestSchema,
+  captureViewItemsSchema,
+  captureSummarySchema,
+} from "./webNetworkCaptureView.js";
 import type { WebNetworkApiSurfaceAccumulator } from "./WebNetworkApiSurfaceAccumulator.js";
-
-/** Public name of the selected-view workflow. */
-export const INSPECT_ANALYSIS_VIEW_OPERATION = "inspect_analysis_view" as const;
+import {
+  pcapViewRequestSchema,
+  pcapViewPageSchema,
+  pcapSummarySchema,
+  projectPcapCaptureView,
+} from "./pcapCaptureView.js";
+import {
+  qlogViewRequestSchema,
+  qlogViewPageSchema,
+  qlogViewContextSchema,
+} from "./qlogCaptureView.js";
+import {
+  projectAndroidPackageView,
+  androidPackageSummarySchema,
+  androidViewRequestSchema,
+  androidManifestViewItemSchema,
+} from "./androidPackageView.js";
+import {
+  projectDartAotView,
+  dartAotSummarySchema,
+  dartAotViewRequestSchema,
+  dartAotViewContextSchema,
+} from "./dartAotView.js";
 
 const summaryViewSchema = z.strictObject({ kind: z.literal("summary") });
 const facetViewSchema = z.strictObject({
@@ -96,6 +174,8 @@ const nativeViewSchema = z.strictObject({
     "unresolved_calls",
     "referenced_strings",
     "referenced_names",
+    "swift_string_literals",
+    "swift_string_literal_omissions",
     "native_api",
     "value_flow_summary",
     "value_flow_operations",
@@ -108,6 +188,28 @@ const nativeViewSchema = z.strictObject({
   limit: z.number().int().positive().default(64),
 });
 
+/** Original inventory records in stable order, optionally matching exact paths. */
+const inventoryViewSchema = z.discriminatedUnion("collection", [
+  z.strictObject({
+    kind: z.literal("inventory"),
+    collection: z.literal("occurrences"),
+    logical_paths: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Exact recorded logical paths. Omitted selects all available occurrences; an empty array selects none. This does not resolve filesystem paths.",
+      ),
+    offset: z.number().int().nonnegative().default(0),
+    limit: z.number().int().positive().default(64),
+  }),
+  z.strictObject({
+    kind: z.literal("inventory"),
+    collection: z.enum(["nodes", "edges", "integrity_contradictions"]),
+    offset: z.number().int().nonnegative().default(0),
+    limit: z.number().int().positive().default(64),
+  }),
+]);
+
 /** Caller-selected projection of already completed analysis Evidence. */
 export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   summaryViewSchema,
@@ -115,7 +217,19 @@ export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   itemViewSchema,
   pageViewSchema,
   nativeViewSchema,
+  inventoryViewSchema,
+  wasmViewRequestSchema,
+  machoViewRequestSchema,
+  interfaceBuilderViewRequestSchema,
+  evmViewRequestSchema,
+  managedViewRequestSchema,
+  managedMembersViewRequestSchema,
+  androidViewRequestSchema,
   apiSurfaceViewSchema,
+  captureViewRequestSchema,
+  qlogViewRequestSchema,
+  pcapViewRequestSchema,
+  dartAotViewRequestSchema,
 ]);
 
 // The application owns admission and authenticated Evidence parsing. SDK and
@@ -155,7 +269,7 @@ const artifactSchema = z.strictObject({
   path: z
     .string()
     .describe("Exact recorded artifact path, including an empty string."),
-  sha256: digestSchema,
+  sha256: digestSchema.nullable(),
 });
 
 const layoutSummarySchema = z.strictObject({
@@ -192,30 +306,30 @@ const javascriptSummarySchema = z.strictObject({
   limitation_count: z.number().int().nonnegative(),
 });
 
-const summaryViewResultFields = {
-  kind: z.literal("summary"),
-  view: summaryViewSchema,
-  parent_evidence_id: prefixedDigestSchema("ev"),
-  parent_digest: digestSchema,
-  view_digest: digestSchema,
-  artifact: artifactSchema,
-  coverage: coverageSchema,
-  limitations: z.array(z.string()),
-  unknowns: z.array(z.string()),
-} as const;
-
-/** Summary `inspect_binary_layout` detail returns; no other view kind. */
-export const binaryLayoutSummaryViewResultSchema = z.strictObject({
-  ...summaryViewResultFields,
-  summary: layoutSummarySchema,
-  parent_operation: z.literal("inspect_binary_layout"),
-});
-
-/** Summary `analyze_javascript_application` detail returns; no other view kind. */
-export const javascriptApplicationSummaryViewResultSchema = z.strictObject({
-  ...summaryViewResultFields,
-  summary: javascriptSummarySchema,
-  parent_operation: z.literal("analyze_javascript_application"),
+const inventorySummarySchema = z.strictObject({
+  manifest: artifactGraphManifestSchema,
+  available_counts: z.strictObject({
+    nodes: z.number().int().nonnegative(),
+    occurrences: z.number().int().nonnegative(),
+    edges: z.number().int().nonnegative(),
+    integrity_contradictions: z.number().int().nonnegative(),
+  }),
+  observed_entry_kind_counts: z.strictObject({
+    file: z.number().int().nonnegative(),
+    directory: z.number().int().nonnegative(),
+    symlink: z.number().int().nonnegative(),
+    slice: z.number().int().nonnegative(),
+  }),
+  source_complete: z.boolean(),
+  inventory_evidence_ids: z.array(prefixedDigestSchema("ev")).min(1),
+  inspection: z
+    .strictObject({
+      coverage: artifactInspectionResultSchema.shape.coverage,
+      unexplored_branches:
+        artifactInspectionResultSchema.shape.unexplored_branches,
+    })
+    .nullable(),
+  limitation_count: z.number().int().nonnegative(),
 });
 
 const viewResultBase = {
@@ -224,6 +338,18 @@ const viewResultBase = {
     "inspect_binary_layout",
     "analyze_javascript_application",
     "analyze_function",
+    "inspect_artifact",
+    "inventory_artifact",
+    "inspect_wasm_artifact",
+    "inspect_macho",
+    "decode_interface_builder",
+    "inspect_evm_interface",
+    "inspect_managed_artifact",
+    "inspect_managed_members",
+    "inspect_web_network_capture",
+    "inspect_android_package",
+    "inspect_pcap_capture",
+    "inspect_dart_aot",
   ]),
   parent_digest: digestSchema,
   view_digest: digestSchema,
@@ -232,6 +358,102 @@ const viewResultBase = {
   limitations: z.array(z.string()),
   unknowns: z.array(z.string()),
 } as const;
+
+const summaryViewResultBase = {
+  kind: z.literal("summary"),
+  view: summaryViewSchema,
+  ...viewResultBase,
+} as const;
+
+/** Summary `inspect_binary_layout` detail returns; no other view kind. */
+export const binaryLayoutSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  summary: layoutSummarySchema,
+  parent_operation: z.literal("inspect_binary_layout"),
+});
+
+/** Summary `analyze_javascript_application` detail returns; no other view kind. */
+export const javascriptApplicationSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  summary: javascriptSummarySchema,
+  parent_operation: z.literal("analyze_javascript_application"),
+});
+
+/** Exact summary carrier for artifact inspection's optional delivery contract. */
+export const artifactInventorySummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.enum(["inspect_artifact", "inventory_artifact"]),
+  summary: inventorySummarySchema,
+});
+
+/** Exact summary carrier for WASM inspection's optional delivery contract. */
+export const wasmArtifactSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_wasm_artifact"),
+  summary: wasmSummarySchema,
+});
+
+/** Exact slice identity and collection counts for Mach-O's selected delivery. */
+export const machoSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_macho"),
+  summary: machoSummarySchema,
+});
+
+/** Decoded documents and graph counts for Interface Builder's selected delivery. */
+export const interfaceBuilderSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("decode_interface_builder"),
+  summary: interfaceBuilderSummarySchema,
+});
+
+/** Exact inferred-interface summary for EVM's caller-selected delivery. */
+export const evmInterfaceSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_evm_interface"),
+  summary: evmSummarySchema,
+});
+
+/** Exact metadata overview for the managed artifact's selected delivery. */
+export const managedArtifactSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_managed_artifact"),
+  summary: managedSummarySchema,
+});
+
+/** Exact member selection, coverage and counts for the selected delivery. */
+export const managedMemberSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_managed_members"),
+  summary: managedMemberSummarySchema,
+});
+
+/** Exact historical capture summary, with no body or member-inventory payload. */
+export const webNetworkCaptureSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_web_network_capture"),
+  summary: captureSummarySchema,
+});
+
+/** Exact package declarations with retained decoded manifest text. */
+export const androidPackageSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_android_package"),
+  summary: androidPackageSummarySchema,
+});
+
+export const pcapCaptureSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_pcap_capture"),
+  summary: pcapSummarySchema,
+});
+
+/** Exact snapshot and pool-coverage carrier for selected AOT delivery. */
+export const dartAotSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_dart_aot"),
+  summary: dartAotSummarySchema,
+});
 
 /** Projected facts for one selected view of retained analysis Evidence. */
 export const analysisViewResultSchema = z.discriminatedUnion("kind", [
@@ -247,10 +469,45 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     }),
   }),
   z.strictObject({
-    kind: z.literal("summary"),
-    view: summaryViewSchema,
-    summary: z.union([layoutSummarySchema, javascriptSummarySchema]),
+    ...summaryViewResultBase,
+    summary: z.union([
+      layoutSummarySchema,
+      javascriptSummarySchema,
+      inventorySummarySchema,
+      wasmSummarySchema,
+      machoSummarySchema,
+      interfaceBuilderSummarySchema,
+      evmSummarySchema,
+      managedSummarySchema,
+      managedMemberSummarySchema,
+      captureSummarySchema,
+      androidPackageSummarySchema,
+      pcapSummarySchema,
+      dartAotSummarySchema,
+    ]),
+  }),
+  z.strictObject({
+    kind: z.literal("capture"),
+    view: captureViewRequestSchema,
+    items: captureViewItemsSchema,
     ...viewResultBase,
+    parent_operation: z.literal("inspect_web_network_capture"),
+  }),
+  z.strictObject({
+    kind: z.literal("qlog"),
+    view: qlogViewRequestSchema,
+    page: qlogViewPageSchema,
+    context: qlogViewContextSchema,
+    ...viewResultBase,
+    parent_operation: z.literal("inspect_web_network_capture"),
+  }),
+  z.strictObject({
+    kind: z.literal("pcap"),
+    view: pcapViewRequestSchema,
+    page: pcapViewPageSchema,
+    source_coverage: z.enum(["complete", "partial"]),
+    ...viewResultBase,
+    parent_operation: z.literal("inspect_pcap_capture"),
   }),
   z.strictObject({
     kind: z.literal("facet"),
@@ -277,6 +534,82 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     item: jsonValueSchema,
     ...viewResultBase,
   }),
+  z.strictObject({
+    kind: z.literal("wasm"),
+    view: wasmViewRequestSchema,
+    item: wasmViewItemSchema,
+    ...viewResultBase,
+  }),
+  z.strictObject({
+    kind: z.literal("macho"),
+    view: machoViewRequestSchema,
+    item: machoViewItemSchema,
+    ...viewResultBase,
+    ...machoViewContextSchema.shape,
+    parent_operation: z.literal("inspect_macho"),
+  }),
+  z.strictObject({
+    kind: z.literal("interface-builder"),
+    view: interfaceBuilderViewRequestSchema,
+    items: interfaceBuilderViewItemsSchema,
+    ...viewResultBase,
+    ...interfaceBuilderViewContextSchema.shape,
+    parent_operation: z.literal("decode_interface_builder"),
+  }),
+  z.strictObject({
+    kind: z.literal("evm"),
+    view: evmViewRequestSchema,
+    item: evmViewItemSchema,
+    ...viewResultBase,
+    parent_operation: z.literal("inspect_evm_interface"),
+  }),
+  z.strictObject({
+    kind: z.literal("managed"),
+    view: managedViewRequestSchema,
+    item: managedViewItemSchema,
+    ...viewResultBase,
+    ...managedViewContextSchema.shape,
+    parent_operation: z.literal("inspect_managed_artifact"),
+  }),
+  z.strictObject({
+    kind: z.literal("managed-members"),
+    view: managedMembersViewRequestSchema,
+    page: managedMembersViewPageSchema,
+    ...viewResultBase,
+    ...managedMembersViewContextSchema.shape,
+    parent_operation: z.literal("inspect_managed_members"),
+  }),
+  z.strictObject({
+    kind: z.literal("android"),
+    view: androidViewRequestSchema,
+    item: androidManifestViewItemSchema,
+    ...viewResultBase,
+    parent_operation: z.literal("inspect_android_package"),
+  }),
+  z.strictObject({
+    kind: z.literal("dart-aot"),
+    view: dartAotViewRequestSchema,
+    items: z.array(z.string()),
+    ...viewResultBase,
+    ...dartAotViewContextSchema.shape,
+    parent_operation: z.literal("inspect_dart_aot"),
+  }),
+  z.strictObject({
+    kind: z.literal("inventory"),
+    view: inventoryViewSchema,
+    manifest: artifactGraphManifestSchema,
+    inventory_evidence_ids: z.array(prefixedDigestSchema("ev")).min(1),
+    source_complete: z.boolean(),
+    items: z.array(
+      z.union([
+        artifactNodeSchema,
+        artifactOccurrenceSchema,
+        artifactEdgeSchema,
+        integrityContradictionSchema,
+      ]),
+    ),
+    ...viewResultBase,
+  }),
 ]);
 
 export type AnalysisViewRequest = z.output<typeof analysisViewRequestSchema>;
@@ -291,17 +624,15 @@ export interface AnalysisViewParent {
   readonly evidenceId: string;
   readonly operation: string;
   readonly normalizedResult: unknown;
+  /** The owner proved normalizedResult belongs to a sealed, deep-frozen Evidence snapshot. */
+  readonly sealedResult?: boolean;
+  /** Preserve the authenticated source identity, including explicit absence. */
+  readonly subject?: Evidence["subject"];
   readonly limitations: readonly string[];
   readonly artifact?: { readonly path: string; readonly sha256: string } | null;
   /** Parent Evidence parameters, when the parent operation records them. */
   readonly parameters?: unknown;
 }
-
-/** Construct a typed input failure for one selected-view constraint. */
-export const analysisViewInputError = (
-  issues: readonly AnalysisInputIssue[],
-): AnalysisInputError =>
-  new AnalysisInputError(INSPECT_ANALYSIS_VIEW_OPERATION, undefined, issues);
 
 /** View payload before the content digest is attached. */
 export type UnsignedAnalysisView =
@@ -318,6 +649,39 @@ export type UnsignedAnalysisView =
   | Omit<Extract<AnalysisViewResult, { readonly kind: "page" }>, "view_digest">
   | Omit<
       Extract<AnalysisViewResult, { readonly kind: "native" }>,
+      "view_digest"
+    >
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "inventory" }>,
+      "view_digest"
+    >
+  | Omit<Extract<AnalysisViewResult, { readonly kind: "wasm" }>, "view_digest">
+  | Omit<Extract<AnalysisViewResult, { readonly kind: "macho" }>, "view_digest">
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "interface-builder" }>,
+      "view_digest"
+    >
+  | Omit<Extract<AnalysisViewResult, { readonly kind: "evm" }>, "view_digest">
+  | Omit<Extract<AnalysisViewResult, { readonly kind: "qlog" }>, "view_digest">
+  | Omit<Extract<AnalysisViewResult, { readonly kind: "pcap" }>, "view_digest">
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "capture" }>,
+      "view_digest"
+    >
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "managed" }>,
+      "view_digest"
+    >
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "managed-members" }>,
+      "view_digest"
+    >
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "android" }>,
+      "view_digest"
+    >
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "dart-aot" }>,
       "view_digest"
     >;
 
@@ -364,7 +728,7 @@ const unsupportedParent = (
   new AnalysisUnsupportedTargetError(
     INSPECT_ANALYSIS_VIEW_OPERATION,
     parentArtifactPath(parent),
-    `Parent Evidence operation ${JSON.stringify(parent.operation)} is not inspect_binary_layout, analyze_javascript_application or analyze_function.`,
+    `Parent Evidence operation ${JSON.stringify(parent.operation)} does not support analysis views. Use completed binary layout, JavaScript application, native function, artifact inventory/inspection, WASM, Mach-O, Interface Builder, EVM, managed artifact or member, Android package, Dart AOT, or web network capture Evidence.`,
   );
 
 const parentArtifactPath = (parent: AnalysisViewParent): string => {
@@ -388,6 +752,20 @@ const parentArtifactPath = (parent: AnalysisViewParent): string => {
   return parent.evidenceId;
 };
 
+/** Named source owners for views that need no extra decoder or accumulator. */
+const retainedViewProjectors = new Map<string, typeof projectWasmArtifactView>([
+  ["inspect_wasm_artifact", projectWasmArtifactView],
+  ["inspect_macho", projectMachoView],
+  ["decode_interface_builder", projectInterfaceBuilderView],
+  ["inspect_evm_interface", projectEvmInterfaceView],
+  ["inspect_managed_artifact", projectManagedArtifactView],
+  ["inspect_managed_members", projectManagedMemberView],
+  ["inspect_android_package", projectAndroidPackageView],
+  ["inspect_dart_aot", projectDartAotView],
+  ["inspect_artifact", projectArtifactInventoryView],
+  ["inventory_artifact", projectArtifactInventoryView],
+]);
+
 /** Project one selected view from authenticated parent analysis Evidence. */
 export const projectAnalysisView = (
   parent: AnalysisViewParent,
@@ -405,15 +783,20 @@ export const projectAnalysisView = (
         },
       ]),
     );
-  if (
-    view.kind === "api-surface" ||
-    parent.operation === "inspect_web_network_capture"
-  ) {
+  if (view.kind === "api-surface") {
     const projected = projectWebNetworkApiSurfaceView(
       parent,
       view,
       apiSurfaceAccumulator,
     );
+    return projected.ok ? ok(sealAnalysisView(projected.value)) : projected;
+  }
+  if (parent.operation === "inspect_web_network_capture") {
+    const projected = projectWebNetworkCaptureView(parent, view);
+    return projected.ok ? ok(sealAnalysisView(projected.value)) : projected;
+  }
+  if (parent.operation === "inspect_pcap_capture") {
+    const projected = projectPcapCaptureView(parent, view);
     return projected.ok ? ok(sealAnalysisView(projected.value)) : projected;
   }
   if (parent.operation === "inspect_binary_layout") {
@@ -457,6 +840,11 @@ export const projectAnalysisView = (
         ),
       );
     const projected = projectNativeFunctionView(parent, native.data, view);
+    return projected.ok ? ok(sealAnalysisView(projected.value)) : projected;
+  }
+  const project = retainedViewProjectors.get(parent.operation);
+  if (project !== undefined) {
+    const projected = project(parent, view);
     return projected.ok ? ok(sealAnalysisView(projected.value)) : projected;
   }
   return err(unsupportedParent(parent));

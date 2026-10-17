@@ -1,4 +1,5 @@
 import * as t from "@babel/types";
+import { runtimeFunctionParameters } from "./javascriptAstValues.js";
 import { JavaScriptSymbolicBindings } from "./javascriptSymbolicBindings.js";
 import {
   symbolicVariants,
@@ -14,9 +15,17 @@ import type { JavaScriptAnalysisAccumulator } from "./javascriptStaticAnalysisSt
 import type {
   ElectronCallPath,
   ElectronCallPathStep,
+  ElectronContextBridgeFinding,
   ElectronIpcDescriptor,
   ElectronIpcFinding,
+  ElectronStaticValue,
 } from "./electronStaticAnalysisTypes.js";
+import {
+  contextBridgeExposureArguments,
+  type JavaScriptContextBridgeExposureArguments,
+} from "./javascriptContextBridgeExposure.js";
+import { boundedExpression } from "./electronStaticAnalysisValues.js";
+import { argumentNode } from "./javascriptStaticAnalysisHelpers.js";
 import {
   childNodes,
   traverseJavaScriptAst,
@@ -27,6 +36,7 @@ import {
   symbolicDefiniteExit,
   symbolicLogicalRight,
 } from "./javascriptSymbolicControlFlow.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 
 const callLabel = (node: t.Node): string =>
   t.isSequenceExpression(node)
@@ -36,6 +46,7 @@ const callLabel = (node: t.Node): string =>
 interface PathContext {
   readonly entryNode: t.Node;
   readonly entry: string;
+  readonly entryPath?: readonly string[];
   readonly entryKind: ElectronCallPath["entry_kind"] | null;
   readonly channel: string | null;
   readonly steps: readonly ElectronCallPathStep[];
@@ -97,6 +108,32 @@ export const collectElectronWrappedCallPaths = (
       ],
     };
   };
+  const sequentialFallthrough = (
+    statement: t.Statement,
+    env: SymbolicEnvironment,
+    context: PathContext,
+  ): { readonly continues: boolean; readonly context: PathContext } => {
+    if (symbolicDefiniteExit(statement)) return { continues: false, context };
+    if (!t.isIfStatement(statement)) return { continues: true, context };
+    const truth = symbolicTruth(resolver.evaluate(statement.test, env));
+    if (truth !== undefined)
+      return symbolicDefiniteExit(
+        truth ? statement.consequent : statement.alternate,
+      )
+        ? { continues: false, context }
+        : { continues: true, context };
+    if (symbolicDefiniteExit(statement.consequent))
+      return {
+        continues: true,
+        context: condition(context, statement.test, false),
+      };
+    if (symbolicDefiniteExit(statement.alternate))
+      return {
+        continues: true,
+        context: condition(context, statement.test),
+      };
+    return { continues: true, context };
+  };
   const metadataContext = (
     context: PathContext,
     value: SymbolicValue,
@@ -114,6 +151,72 @@ export const collectElectronWrappedCallPaths = (
   };
   const hasConditions = (value: SymbolicValue): boolean =>
     symbolicVariants(value).some((variant) => variant.conditions?.length);
+  function* bridgeMemberFunctions(
+    value: SymbolicValue,
+    segments: readonly string[] = [],
+    active = new Set<SymbolicValue>(),
+  ): Generator<{
+    readonly name: string;
+    readonly path: readonly string[];
+    readonly fn: SymbolicFunction;
+  }> {
+    if (active.has(value)) return;
+    if (active.size >= 128) {
+      accumulator.unknownFindings += 1;
+      accumulator.electronCallPathLimitReached = true;
+      return;
+    }
+    const nested = new Set(active);
+    nested.add(value);
+    for (const member of [...resolver.members(value)].sort()) {
+      if (--remainingVisits < 0) return;
+      const path = [...segments, member];
+      const name = path.join(".");
+      for (const variant of symbolicVariants(
+        resolver.property(value, member),
+      )) {
+        if (variant.kind === "function") yield { name, path, fn: variant };
+        else if (resolver.members(variant).length > 0)
+          yield* bridgeMemberFunctions(variant, path, nested);
+      }
+      if (remainingVisits < 0) return;
+    }
+  }
+  const isolatedBridgeCall = (
+    node: t.CallExpression | t.OptionalCallExpression,
+  ):
+    | { readonly env: SymbolicEnvironment; readonly callee: SymbolicValue }
+    | undefined => {
+    const env = resolver.environmentAt(node);
+    const callee = resolver.evaluate(node.callee, env);
+    return symbolicVariants(callee).some(
+      (callee) =>
+        callee.kind === "external" &&
+        identity.intactExport(callee.path) &&
+        callee.path.slice(1).join(".") ===
+          "contextBridge.exposeInIsolatedWorld",
+    )
+      ? { env, callee }
+      : undefined;
+  };
+  const electronStaticSymbolicValue = (
+    value: SymbolicValue | undefined,
+    node: t.Node | undefined,
+  ): ElectronStaticValue => {
+    const variants = value === undefined ? [] : symbolicVariants(value);
+    const variant = variants.length === 1 ? variants[0] : undefined;
+    if (variant?.kind === "literal" && variant.value !== undefined)
+      return {
+        status: "literal",
+        value: variant.value,
+        expression: null,
+      };
+    return {
+      status: "dynamic",
+      value: null,
+      expression: boundedExpression(source, node),
+    };
+  };
   const emit = (
     context: PathContext,
     node: t.Node,
@@ -124,6 +227,10 @@ export const collectElectronWrappedCallPaths = (
     const path: ElectronCallPath = {
       entry_kind: context.entryKind,
       entry: context.entry,
+      ...(context.entryKind !== "bridge-member" ||
+      context.entryPath === undefined
+        ? {}
+        : { entry_path: context.entryPath }),
       channel,
       terminal,
       resolution: "candidate",
@@ -288,17 +395,34 @@ export const collectElectronWrappedCallPaths = (
   };
   const bridge = (
     node: t.CallExpression | t.OptionalCallExpression,
-    args: readonly SymbolicValue[],
+    exposure: JavaScriptContextBridgeExposureArguments<SymbolicValue>,
     context: PathContext,
     guardedDispatch: boolean,
   ): void => {
-    const key = args[0];
-    const object = args[1];
+    const key = exposure.apiKey;
+    const object = exposure.api;
+    const worldValue =
+      exposure.worldId === null
+        ? null
+        : (exposure.worldId ?? symbolicUnknown("missing world id"));
+    const worldContext =
+      worldValue === null ? context : metadataContext(context, worldValue);
+    if (!worldContext) return;
+    const worldId =
+      worldValue === null
+        ? null
+        : electronStaticSymbolicValue(
+            worldValue,
+            exposure.worldIdIndex === null
+              ? undefined
+              : argumentNode(node.arguments[exposure.worldIdIndex]),
+          );
+    if (worldId?.status === "dynamic") accumulator.unknownFindings += 1;
     if (key?.kind !== "literal" || typeof key.value !== "string" || !object) {
       accumulator.unknownFindings += 1;
       return;
     }
-    const keyContext = metadataContext(context, key);
+    const keyContext = metadataContext(worldContext, key);
     if (!keyContext || !metadataContext(keyContext, object)) return;
     const members = [...resolver.members(object)].sort();
     const location = range(node);
@@ -306,24 +430,31 @@ export const collectElectronWrappedCallPaths = (
       ({ value }) =>
         JSON.stringify(value.location) === JSON.stringify(location),
     );
-    const finding = {
-      world: "main" as const,
-      world_id: null,
+    const finding: ElectronContextBridgeFinding = {
+      world: exposure.world,
+      world_id: worldId,
       api_key: key.value,
       api_key_expression: null,
       api_status: "dynamic" as const,
       resolution_basis: "wrapper-substitution" as const,
-      members,
+      // The direct syntax pass recursively retains literal dotted paths. The
+      // symbolic resolver enumerates only immediate object keys, so its
+      // replacement must not erase paths already established at this call.
+      members: [
+        ...new Set([...(existing?.value.members ?? []), ...members]),
+      ].sort(compareUnicodeCodePoints),
       unknown_members: resolver.unknownMembers(object),
       module_key: null,
       location,
     };
     // This report shape has no predicate field, so a guarded world or object
     // cannot be recorded as an unconditional exposure fact.
+    const guardedWorld = worldValue !== null && hasConditions(worldValue);
     const guardedKey = hasConditions(key);
     const guardedObject = hasConditions(object);
     const guarded =
       context.conditions.length > 0 ||
+      guardedWorld ||
       guardedKey ||
       guardedObject ||
       guardedDispatch;
@@ -343,35 +474,36 @@ export const collectElectronWrappedCallPaths = (
         offset: node.start ?? -1,
         value: finding,
       });
-    for (const name of members) {
-      const value = resolver.property(object, name);
-      for (const fn of symbolicVariants(value))
-        if (fn.kind === "function") {
-          const memberContext = metadataContext(keyContext, fn);
-          if (!memberContext) continue;
-          functionBody(
-            fn,
-            fn.node.params.map(() => symbolicUnknown("public API argument")),
-            {
-              ...memberContext,
-              entryNode: node,
-              entryKind: "bridge-member",
-              entry: `${key.value}.${name}`,
-              channel: null,
-              steps: [step(node, "exposure", `${key.value}.${name}`)],
-              active: new Set(),
-            },
-            node,
-          );
-        }
+    for (const { name, path, fn } of bridgeMemberFunctions(object)) {
+      const memberContext = metadataContext(keyContext, fn);
+      if (!memberContext) continue;
+      const entry = `${key.value}.${name}`;
+      functionBody(
+        fn,
+        runtimeFunctionParameters(fn.node).map(() =>
+          symbolicUnknown("public API argument"),
+        ),
+        {
+          ...memberContext,
+          entryNode: node,
+          entryKind: "bridge-member",
+          entry,
+          entryPath: [key.value, ...path],
+          channel: null,
+          steps: [step(node, "exposure", entry)],
+          active: new Set(),
+        },
+        node,
+      );
     }
   };
   const call = (
     node: t.CallExpression | t.OptionalCallExpression,
     env: SymbolicEnvironment,
     context: PathContext,
+    evaluatedCallee?: SymbolicValue,
   ): void => {
-    const value = resolver.evaluate(node.callee, env);
+    const value = evaluatedCallee ?? resolver.evaluate(node.callee, env);
     const args = resolver.arguments(node, env);
     for (const callee of symbolicVariants(value)) {
       const branchContext = metadataContext(context, callee);
@@ -394,7 +526,13 @@ export const collectElectronWrappedCallPaths = (
         const endpoint = path.join(".");
         if (identity.intactExport(path)) {
           const descriptor = ipcDescriptor(path.slice(1));
-          if (descriptor)
+          const exposure =
+            path.length === 3 && path[1] === "contextBridge"
+              ? contextBridgeExposureArguments(path[2] ?? "", args)
+              : undefined;
+          if (exposure)
+            bridge(node, exposure, branchContext, hasConditions(callee));
+          else if (descriptor)
             ipc(
               node,
               descriptor,
@@ -403,10 +541,6 @@ export const collectElectronWrappedCallPaths = (
               endpoint,
               hasConditions(callee),
             );
-          else if (
-            path.slice(1).join(".") === "contextBridge.exposeInMainWorld"
-          )
-            bridge(node, args, branchContext, hasConditions(callee));
           else if (path[1] === "clipboard") emit(branchContext, node, endpoint);
         } else if (
           (path[0] === "navigator" && path[1] === "clipboard") ||
@@ -426,21 +560,9 @@ export const collectElectronWrappedCallPaths = (
       let next = context;
       for (const statement of node.body) {
         walk(statement, env, next);
-        if (symbolicDefiniteExit(statement)) break;
-        if (t.isIfStatement(statement)) {
-          const truth = symbolicTruth(resolver.evaluate(statement.test, env));
-          if (truth !== undefined) {
-            if (
-              symbolicDefiniteExit(
-                truth ? statement.consequent : statement.alternate,
-              )
-            )
-              break;
-          } else if (symbolicDefiniteExit(statement.consequent))
-            next = condition(next, statement.test, false);
-          else if (symbolicDefiniteExit(statement.alternate))
-            next = condition(next, statement.test);
-        }
+        const fallthrough = sequentialFallthrough(statement, env, next);
+        if (!fallthrough.continues) break;
+        next = fallthrough.context;
       }
       return;
     }
@@ -488,8 +610,12 @@ export const collectElectronWrappedCallPaths = (
     enter: (node) => {
       if (!t.isCallExpression(node) && !t.isOptionalCallExpression(node))
         return;
-      if (!t.isStringLiteral(node.arguments[0])) return;
-      const env = resolver.environmentAt(node);
+      const isolatedSeed = t.isStringLiteral(node.arguments[0])
+        ? undefined
+        : isolatedBridgeCall(node);
+      if (!t.isStringLiteral(node.arguments[0]) && isolatedSeed === undefined)
+        return;
+      const env = isolatedSeed?.env ?? resolver.environmentAt(node);
       let context: PathContext = {
         entryNode: node,
         entry: "",
@@ -527,16 +653,20 @@ export const collectElectronWrappedCallPaths = (
           const index = parent.body.findIndex(
             (statement) => statement === child,
           );
-          if (
-            index >= 0 &&
-            parent.body
-              .slice(0, index)
-              .some((statement) => symbolicDefiniteExit(statement))
-          )
-            return;
+          if (index >= 0) {
+            for (const statement of parent.body.slice(0, index)) {
+              const fallthrough = sequentialFallthrough(
+                statement,
+                env,
+                context,
+              );
+              if (!fallthrough.continues) return;
+              context = fallthrough.context;
+            }
+          }
         }
       }
-      call(node, env, context);
+      call(node, env, context, isolatedSeed?.callee);
     },
   });
   if (remainingVisits < 0 || resolver.truncated) {

@@ -1,13 +1,11 @@
 import * as t from "@babel/types";
 
-import { semanticBuiltinNamespacePath } from "./javascriptSemanticProvenance.js";
-
 import type {
   JavaScriptSemanticCallable,
   JavaScriptSemanticEventOperation,
   JavaScriptSemanticTimerOperation,
 } from "./javascriptSemanticIr.js";
-import { semanticCallableIdForNode } from "./javascriptSemanticProjection.js";
+import { createSemanticCallableIdStack } from "./javascriptSemanticCallableStack.js";
 import { semanticStaticPropertyName } from "./javascriptAstValues.js";
 import {
   resolveSemanticBindingState,
@@ -18,6 +16,7 @@ import {
 import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
 import { range } from "./javascriptStaticAnalysisHelpers.js";
 import {
+  builtinDataEffectMethod,
   dataEffectLiteralString,
   dataEffectMemberCallee,
   assignedSemanticResultBindings,
@@ -37,6 +36,13 @@ const EVENT_REMOVE_METHODS = [
   "removeListener",
   "removeAllListeners",
 ] as const;
+/**
+ * Methods whose argument position 1 names a listener. `removeAllListeners`
+ * takes only an optional event name, and `emit` passes its remaining
+ * arguments as data to listeners that already exist.
+ */
+const EVENT_LISTENER_METHODS: readonly JavaScriptSemanticEventOperation["method"][] =
+  [...EVENT_REGISTER_METHODS, "off", "removeListener"];
 const EVENT_METHODS = [
   ...EVENT_REGISTER_METHODS,
   ...EVENT_REMOVE_METHODS,
@@ -88,15 +94,13 @@ export const collectJavaScriptSemanticAsyncEffects = (
   const events: JavaScriptSemanticEventOperation[] = [];
   const timers: TimerCandidate[] = [];
   const callableIds = new Set(callables.map(({ callableId }) => callableId));
-  const callableStack: string[] = [];
+  const callableStack = createSemanticCallableIdStack(callableIds);
   const ancestors: t.Node[] = [];
   traverseJavaScriptAst(program, {
-    enter: (node) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null && callableIds.has(callableId))
-        callableStack.push(callableId);
+    enter: (node, parent) => {
+      callableStack.enter(node, parent);
       if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
-        const ownerCallableId = callableStack.at(-1) ?? null;
+        const ownerCallableId = callableStack.callables.at(-1) ?? null;
         collectEvent(node, ownerCallableId, state, events);
         collectTimer({
           node,
@@ -109,10 +113,8 @@ export const collectJavaScriptSemanticAsyncEffects = (
       ancestors.push(node);
     },
     exit: (node) => {
-      const callableId = semanticCallableIdForNode(node);
       ancestors.pop();
-      if (callableId !== null && callableStack.at(-1) === callableId)
-        callableStack.pop();
+      callableStack.exit(node);
     },
   });
   return {
@@ -137,7 +139,9 @@ const collectEvent = (
   if (method === undefined) return;
   const kind = eventKind(method);
   const eventArgument = node.arguments[0];
-  const listenerArgument = node.arguments[1];
+  const listenerArgument = EVENT_LISTENER_METHODS.includes(method)
+    ? node.arguments[1]
+    : undefined;
   const emitter = emitterIdentity(member.object, state);
   const eventName = dataEffectLiteralString(eventArgument);
   output.push({
@@ -299,50 +303,17 @@ const timerMethod = (
         ? null
         : method;
     }
-    return timerMethodFromBinding(binding);
   }
-  if (!t.isMemberExpression(callee) && !t.isOptionalMemberExpression(callee))
-    return null;
-  const method = admittedTimerMethod(
-    semanticStaticPropertyName(callee.property, callee.computed),
+  return admittedTimerMethod(
+    builtinDataEffectMethod(callee, state, ["timers", "node:timers"]) ?? "",
   );
-  return method !== null &&
-    t.isIdentifier(callee.object) &&
-    timerNamespaceBinding(
-      resolveSemanticBindingState(state, callee.object, callee.object.name),
-    )
-    ? method
-    : null;
 };
-
 const admittedTimerMethod = (
   value: string,
 ): JavaScriptSemanticTimerOperation["method"] | null =>
   [...TIMER_SCHEDULE_METHODS, ...TIMER_CANCEL_METHODS].find(
     (candidate) => candidate === value,
   ) ?? null;
-
-const timerMethodFromBinding = (
-  binding: JavaScriptSemanticBindingState,
-): JavaScriptSemanticTimerOperation["method"] | null => {
-  for (const { specifier, importedPath } of binding.directOrigins) {
-    if (!timerModule(specifier)) continue;
-    const method = admittedTimerMethod(importedPath.at(-1) ?? "");
-    if (method !== null) return method;
-  }
-  return null;
-};
-
-const timerNamespaceBinding = (
-  binding: JavaScriptSemanticBindingState | undefined,
-): boolean =>
-  binding?.directOrigins.some(
-    ({ specifier, importedPath }) =>
-      timerModule(specifier) && semanticBuiltinNamespacePath(importedPath),
-  ) ?? false;
-
-const timerModule = (specifier: string): boolean =>
-  specifier === "timers" || specifier === "node:timers";
 
 const bindingId = (
   node:

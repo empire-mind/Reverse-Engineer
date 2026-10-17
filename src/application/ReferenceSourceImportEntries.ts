@@ -12,12 +12,14 @@ import {
   detectReferenceSourceLanguage,
 } from "../domain/referenceSourceClassification.js";
 import type { HistoricalSourceGraphInput } from "../domain/referenceSourceGraph.js";
-import { parseReferenceSourceImports } from "../domain/referenceSourceImportParsing.js";
+import {
+  parseReferenceSourceImports,
+  PARSEABLE_REFERENCE_SOURCE_LANGUAGES,
+} from "../domain/referenceSourceImportParsing.js";
 import type {
   ReferenceSourceEntry,
   ReferenceSourceRead,
 } from "../reference/ReferenceSourceReaderTypes.js";
-import { PARSEABLE_REFERENCE_SOURCE_LANGUAGES } from "./ReferenceSourceImportTypes.js";
 import { typescriptEmittedSourceCandidates } from "./TypeScriptEmittedSourceCandidates.js";
 
 export interface ParsedReferenceSourceEntries {
@@ -43,6 +45,8 @@ const entryRecoveryGuidance = (
     return "This directory could not be read. Check its permissions, then try again.";
   if (entry.kind === "symlink")
     return "This symbolic link could not be read safely. Check the link and its permissions, then try again.";
+  if (entry.kind === "unknown")
+    return "This entry's type could not be determined. Check the parent directory and try again.";
   return "This file could not be read. Check its permissions, then try again.";
 };
 
@@ -71,6 +75,13 @@ const failedEntry = (
       classifications,
       limitations: [limitation],
     };
+  if (entry.kind === "unknown" || entry.kind === "other")
+    return {
+      path: entry.path,
+      kind: "unknown",
+      classifications: ["unknown"],
+      limitations: [limitation],
+    };
   return {
     path: entry.path,
     kind: "file",
@@ -95,26 +106,40 @@ const resolveInternalSpecifier = (
   );
   if (logicalPathEscapesRoot(normalized))
     return { to: normalized, resolution: "unresolved" };
+  // Preserve directory intent before normalization removes terminal dot segments.
+  const directoryReference =
+    specifier.endsWith("/") || [".", ".."].includes(posix.basename(specifier));
   const suffixes = ["", ".ts", ".js", ".mjs", ".cjs", ".tsx", ".jsx"];
   const candidates = suffixes.flatMap((suffix) => [
-    `${normalized}${suffix}`,
-    `${normalized}/index${suffix}`,
+    ...(directoryReference ? [] : [`${normalized}${suffix}`]),
+    posix.join(normalized, `index${suffix}`),
   ]);
   // Retain present runtime files first; substitute only a missing counterpart.
   // Counterparts cover explicit filenames, not directory/index resolution.
-  candidates.push(...typescriptEmittedSourceCandidates(fromPath, normalized));
+  if (!directoryReference)
+    candidates.push(
+      ...typescriptEmittedSourceCandidates(fromPath, normalized).map(
+        ({ path }) => path,
+      ),
+    );
   const match = lookupPath.resolveCandidates(candidates);
   return match === undefined
     ? { to: normalized, resolution: "unresolved" }
     : { to: match, resolution: "internal" };
 };
 
+type ReadFile = Extract<ReferenceSourceEntry, { status: "read"; kind: "file" }>;
+
 const appendFile = (
-  entry: Extract<ReferenceSourceEntry, { status: "read"; kind: "file" }>,
+  entry: ReadFile,
   lookupPath: ReferenceSourcePathLookup,
   output: ParsedReferenceSourceEntries,
 ): void => {
   const language = detectReferenceSourceLanguage(entry.path);
+  const parsed =
+    language === null || !PARSEABLE_REFERENCE_SOURCE_LANGUAGES.has(language)
+      ? undefined
+      : parseReferenceSourceImports(entry.path, entry.bytes, language);
   output.entries.push({
     path: entry.path,
     kind: "file",
@@ -123,11 +148,9 @@ const appendFile = (
     language,
     classifications: classifyReferenceSourcePath(entry.path),
     content_state: "hashed",
-    limitations: [],
+    limitations: [...(parsed?.limitations ?? [])],
   });
-  if (language === null || !PARSEABLE_REFERENCE_SOURCE_LANGUAGES.has(language))
-    return;
-  const parsed = parseReferenceSourceImports(entry.path, entry.bytes, language);
+  if (parsed === undefined) return;
   for (const relationship of parsed.relationships) {
     if (relationship.resolution !== "internal") {
       output.relationships.push(relationship);

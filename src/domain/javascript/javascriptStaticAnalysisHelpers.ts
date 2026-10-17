@@ -13,10 +13,12 @@ import type {
 } from "./javascriptStaticAnalysisTypes.js";
 import {
   readExactJavaScriptLiteral,
+  runtimeFunctionParameters,
   semanticStaticPropertyKey,
   semanticStaticPropertyName,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
+import type { JavaScriptOpenReceiverFact } from "./javascriptSemanticAnalysis.js";
 import {
   compareUnicodeCodePoints,
   compositeKey,
@@ -146,7 +148,7 @@ export const modulePropertyName = (
 export const factoryRequireName = (
   factory: t.FunctionExpression | t.ArrowFunctionExpression | t.ObjectMethod,
 ): string | null => {
-  const parameter = factory.params[2];
+  const parameter = runtimeFunctionParameters(factory)[2];
   return t.isIdentifier(parameter) ? parameter.name : null;
 };
 
@@ -181,16 +183,35 @@ export const staticPath = (node: t.Node): string | undefined => {
   if (t.isStringLiteral(node)) return node.value;
   if (t.isTemplateLiteral(node) && node.expressions.length === 0)
     return stringValue(node);
-  if (t.isBinaryExpression(node, { operator: "+" })) {
-    const left = staticPath(node.left);
-    const right = staticPath(node.right);
-    return left === undefined || right === undefined
-      ? undefined
-      : `${left}${right}`;
-  }
+  if (t.isBinaryExpression(node, { operator: "+" }))
+    return staticConcatenation(node);
   if (t.isCallExpression(node) || t.isNewExpression(node))
     return staticCallPath(node);
   return undefined;
+};
+
+/**
+ * Concatenate inert text. A leading source directory contributes no text:
+ * `__dirname + "/preload.js"` names a file inside it, while text without a
+ * leading separator extends the directory's own name and stays unknown.
+ */
+const staticConcatenation = (node: t.BinaryExpression): string | undefined => {
+  const operands: t.Node[] = [];
+  let current: t.Node = node;
+  while (t.isBinaryExpression(current, { operator: "+" })) {
+    operands.push(current.right);
+    current = current.left;
+  }
+  const anchored = isDirectoryPath(current);
+  if (!anchored) operands.push(current);
+  let text = "";
+  for (const operand of operands.reverse()) {
+    const value = staticPath(operand);
+    if (value === undefined) return undefined;
+    text += value;
+  }
+  if (!anchored) return text;
+  return text.startsWith("/") ? posix.join(".", text) : undefined;
 };
 
 const staticCallPath = (
@@ -202,13 +223,8 @@ const staticCallPath = (
       ? stringValue(node.arguments[0])
       : undefined;
   if (name === "fileURLToPath" || name.endsWith(".fileURLToPath")) {
-    return staticFileUrlPath(argumentNode(node.arguments[0]));
+    return staticFileUrlPath(node);
   }
-  if (
-    (name === "dirname" || name.endsWith(".dirname")) &&
-    isFileIdentity(argumentNode(node.arguments[0]))
-  )
-    return "";
   if (name.endsWith(".resolve"))
     return name === "win32.resolve" || name.endsWith(".win32.resolve")
       ? undefined
@@ -216,7 +232,12 @@ const staticCallPath = (
   if (!name.endsWith(".join") && name !== "join") return undefined;
   const parts: string[] = [];
   for (const argument of node.arguments) {
-    if (isDirectoryIdentity(argumentNode(argument))) continue;
+    if (isDirectoryIdentity(argumentNode(argument))) {
+      // join never resets at an absolute segment, so `/preload.js` after the
+      // source directory stays inside it.
+      parts.push(".");
+      continue;
+    }
     const value = t.isNode(argument) ? staticPath(argument) : undefined;
     if (value === undefined) return undefined;
     parts.push(value);
@@ -225,12 +246,34 @@ const staticCallPath = (
 };
 
 const staticFileUrlPath = (
-  argument: t.Node | undefined,
+  node: t.CallExpression | t.NewExpression,
 ): string | undefined => {
+  if (node.arguments.length !== 1) return undefined;
+  const argument = argumentNode(node.arguments[0]);
   if (argument === undefined) return undefined;
-  return isSourceFileUrl(argument)
-    ? sourceRelativeFileUrlPath(argument)
-    : staticPath(argument);
+  if (isSourceFileUrl(argument)) return sourceRelativeFileUrlPath(argument);
+  const value = staticPath(argument);
+  const rawPath = value?.split(/[?#]/u, 1)[0] ?? "";
+  if (
+    value === undefined ||
+    !/^file:/iu.test(value) ||
+    value !== value.trim() ||
+    value.includes("\\") ||
+    [...value].some((character) => character.charCodeAt(0) < 32) ||
+    /%(?:2f|5c)/iu.test(rawPath)
+  )
+    return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "file:") return undefined;
+    // Canonical analysis paths use POSIX spelling so results do not depend on
+    // the analyzer host. Drive and UNC paths need an explicit target platform.
+    const path = fileURLToPath(url, { windows: false });
+    return /^\/[a-z]:/iu.test(path) ? undefined : path;
+  } catch (cause: unknown) {
+    void cause;
+    return undefined;
+  }
 };
 
 /** Project a known source-relative URL through the actual file URL decoder. */
@@ -318,10 +361,13 @@ const isFilesystemPathExpression = (node: t.Node): boolean => {
     if (name === "URL" || name.endsWith(".URL"))
       return isFileIdentity(argumentNode(node.arguments[1]));
     if (name === "fileURLToPath" || name.endsWith(".fileURLToPath"))
-      return node.arguments.some((argument) => {
-        const value = argumentNode(argument);
-        return value !== undefined && isFilesystemPathExpression(value);
-      });
+      return (
+        staticFileUrlPath(node) !== undefined ||
+        node.arguments.some((argument) => {
+          const value = argumentNode(argument);
+          return value !== undefined && isFilesystemPathExpression(value);
+        })
+      );
     return node.arguments.some((argument) => {
       const value = argumentNode(argument);
       return value !== undefined && isFilesystemPathExpression(value);
@@ -331,27 +377,43 @@ const isFilesystemPathExpression = (node: t.Node): boolean => {
 };
 
 const isDirectoryIdentity = (node: t.Node | undefined): boolean => {
-  if (t.isIdentifier(node, { name: "__dirname" })) return true;
+  if (isDirectoryPath(node)) return true;
   if (!t.isCallExpression(node) && !t.isNewExpression(node)) return false;
   const name = calleeName(node.callee);
-  if (name === "URL" || name.endsWith(".URL"))
-    return isFileIdentity(argumentNode(node.arguments[1]));
+  return (
+    (name === "URL" || name.endsWith(".URL")) &&
+    isFileIdentity(argumentNode(node.arguments[1]))
+  );
+};
+
+/** `__dirname` or the dirname of the source file, as a string. */
+const isDirectoryPath = (node: t.Node | undefined): boolean => {
+  if (t.isIdentifier(node, { name: "__dirname" })) return true;
+  if (!t.isCallExpression(node)) return false;
+  const name = calleeName(node.callee);
   return (
     (name === "dirname" || name.endsWith(".dirname")) &&
     isFileIdentity(argumentNode(node.arguments[0]))
   );
 };
 
-const isFileIdentity = (node: t.Node | undefined): boolean => {
-  if (t.isIdentifier(node, { name: "__filename" })) return true;
+/** Whether the expression denotes the current module's URL. */
+export const isImportMetaUrl = (node: t.Node | undefined): boolean => {
   if (node === undefined) return false;
-  if (
-    t.isMemberExpression(node) &&
-    t.isMetaProperty(node.object) &&
-    node.object.meta.name === "import" &&
-    node.object.property.name === "meta" &&
-    semanticStaticPropertyName(node.property, node.computed) === "url"
-  )
+  const expression = unwrapJavaScriptExpression(node).node;
+  if (!t.isMemberExpression(expression)) return false;
+  const object = unwrapJavaScriptExpression(expression.object).node;
+  return (
+    t.isMetaProperty(object) &&
+    object.meta.name === "import" &&
+    object.property.name === "meta" &&
+    semanticStaticPropertyName(expression.property, expression.computed) ===
+      "url"
+  );
+};
+
+const isFileIdentity = (node: t.Node | undefined): boolean => {
+  if (t.isIdentifier(node, { name: "__filename" }) || isImportMetaUrl(node))
     return true;
   if (!t.isCallExpression(node)) return false;
   const name = calleeName(node.callee);
@@ -373,12 +435,26 @@ const XHR_METHODS = new Set([
   "TRACE",
 ]);
 
-/** An absolute HTTP(S)/WebSocket URL, or an absolute or relative path. */
-const isRequestUrlLiteral = (value: string): boolean =>
+/** Legacy URL/path shapes that bypass the overloaded lookup exclusions. */
+const isRequestUrlOrPathLiteral = (value: string): boolean =>
   /^(?:https?|wss?):\/\//iu.test(value) ||
   value.startsWith("/") ||
   value.startsWith("./") ||
   value.startsWith("../");
+
+/** Explicit request references, classified after receiver-specific exclusions. */
+const isRequestUrlReference = (value: string): boolean => {
+  if (
+    isRequestUrlOrPathLiteral(value) ||
+    value.startsWith("?") ||
+    value.startsWith("#")
+  )
+    return true;
+  // WHATWG accepts HTTP/WS scheme forms without authority slashes. Parse
+  // without a base so bare keys stay ambiguous, and keep the source spelling.
+  if (!/^(?:https?|wss?):/iu.test(value)) return false;
+  return URL.parse(value) !== null;
+};
 
 /**
  * Browsing-context and document `open` take a URL or type first and a target
@@ -435,13 +511,7 @@ const xhrOpenUrl = (
   name: string,
   methodNode: t.Node | null | undefined,
   urlNode: t.Node | null | undefined,
-  receiverFact?:
-    | "window"
-    | "indexed-db"
-    | "cache-storage"
-    | "local"
-    | "local-indexed-db"
-    | "local-cache-storage",
+  receiverFact?: JavaScriptOpenReceiverFact,
 ): string | undefined => {
   const url = stringValue(urlNode);
   if (url === undefined) return undefined;
@@ -507,10 +577,20 @@ const isKeyedCollectionReceiver = (callee: t.Node): boolean => {
     receiver.property,
     receiver.computed,
   );
-  return property === "headers" || property === "searchParams";
+  return (
+    property === "headers" ||
+    property === "headersList" ||
+    property === "searchParams"
+  );
 };
 
-/** Select the literal URL argument for recognized network callees. */
+/** A literal endpoint shape or an ambiguous argument of an HTTP-method-named call. */
+export interface JavaScriptEndpointArgument {
+  readonly kind: "endpoint" | "candidate";
+  readonly value: string;
+}
+
+/** Classify one literal without treating a generic method name as network identity. */
 export const endpointArgument = (
   name: string,
   args: readonly (
@@ -520,19 +600,32 @@ export const endpointArgument = (
     | t.ArgumentPlaceholder
   )[],
   callee: t.Node,
-  receiverFact?:
-    | "window"
-    | "indexed-db"
-    | "cache-storage"
-    | "local"
-    | "local-indexed-db"
-    | "local-cache-storage",
-): string | undefined => {
+  receiverFact?: JavaScriptOpenReceiverFact,
+): JavaScriptEndpointArgument | undefined => {
+  const literal = (
+    value: string | undefined,
+  ): JavaScriptEndpointArgument | undefined =>
+    value === undefined ? undefined : { kind: "endpoint", value };
   if (receiverFact === "window") return undefined;
-  if (name === "fetch" || name.endsWith(".fetch") || name === "WebSocket")
-    return stringValue(args[0]);
-  if (name.endsWith(".open"))
-    return xhrOpenUrl(name, args[0], args[1], receiverFact);
+  if (
+    name === "fetch" ||
+    name.endsWith(".fetch") ||
+    name === "WebSocket" ||
+    name === "EventSource" ||
+    name.endsWith(".EventSource")
+  )
+    return literal(stringValue(args[0]));
+  if (name.endsWith(".open")) {
+    const value = xhrOpenUrl(name, args[0], args[1], receiverFact);
+    if (value === undefined) return undefined;
+    return {
+      kind:
+        stringValue(args[0]) !== undefined || isRequestUrlReference(value)
+          ? "endpoint"
+          : "candidate",
+      value,
+    };
+  }
   const method = ["get", "post", "put", "patch", "delete", "request"].find(
     (candidate) => name === candidate || name.endsWith(`.${candidate}`),
   );
@@ -540,14 +633,27 @@ export const endpointArgument = (
     const value = stringValue(args[0]);
     // Only get and delete also belong to the keyed-collection APIs, whose
     // keys are header, field, and parameter names rather than URLs or paths.
-    return value !== undefined &&
+    // Configuration `get` reads setting keys.
+    if (value === undefined) return undefined;
+    if (
       (method === "get" || method === "delete") &&
-      !isRequestUrlLiteral(value) &&
-      isKeyedCollectionReceiver(callee)
-      ? undefined
-      : value;
+      !isRequestUrlOrPathLiteral(value) &&
+      (isKeyedCollectionReceiver(callee) ||
+        (method === "get" &&
+          (receiverFact === "configuration" ||
+            receiverFact === "extension-state")))
+    )
+      return undefined;
+    return {
+      kind: isRequestUrlReference(value) ? "endpoint" : "candidate",
+      value,
+    };
   }
-  if (name.endsWith("loadURL")) return stringValue(args[0]);
+  // Beacon URLs are endpoint observations, retaining the upstream API support.
+  if (name === "sendBeacon" || name.endsWith(".sendBeacon"))
+    return literal(stringValue(args[0]));
+  if (name === "loadURL" || name.endsWith(".loadURL"))
+    return literal(stringValue(args[0]));
   return undefined;
 };
 
@@ -684,6 +790,14 @@ export const registrationKey = (
     registration.runtime,
     registration.chunk_keys,
     String(registration.unknown_chunk_keys),
+    // Equal factory tables can be registered with different runtime callbacks.
+    // Both early collection and finalization must retain those recovered facts.
+    registration.runtime_require_name,
+    registration.runtime_module_cache_status,
+    registration.entry_module_keys,
+    String(registration.unknown_entry_module_keys),
+    registration.async_chunk_keys,
+    String(registration.unknown_async_chunk_keys),
     registration.modules.map(({ module_key: key, source_sha256: digest }) => [
       key,
       digest,

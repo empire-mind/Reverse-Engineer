@@ -1,4 +1,4 @@
-import { basename, isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { valid } from "semver";
 
 import { PRODUCT_IDENTITY } from "../identity.js";
@@ -76,18 +76,24 @@ const unwrapCmdCommand = (command: readonly string[]): readonly string[] => {
   return [];
 };
 
-const packageRunnerReference = (
+/** Preserve the package argument from a supported package-runner command. */
+export const clientRegistrationPackageReference = (
   command: readonly string[],
 ): string | undefined => {
+  const arguments_ = unwrapCmdCommand(command);
   if (
-    command.length === 4 &&
-    command[0] === "npx" &&
-    command[1] === "-y" &&
-    command[3] === "mcp"
+    arguments_.length === 4 &&
+    arguments_[0] === "npx" &&
+    arguments_[1] === "-y" &&
+    arguments_[3] === "mcp"
   )
-    return command[2];
-  if (command.length === 3 && command[0] === "bunx" && command[2] === "mcp")
-    return command[1];
+    return arguments_[2];
+  if (
+    arguments_.length === 3 &&
+    arguments_[0] === "bunx" &&
+    arguments_[2] === "mcp"
+  )
+    return arguments_[1];
   return undefined;
 };
 
@@ -106,13 +112,56 @@ const isOwnedPackageReference = (packageReference: string): boolean => {
 };
 
 /** Check that one parsed command points to REA's MCP entry point. */
+export type ClientRegistrationCommandIdentity = "owned" | "foreign" | "unknown";
+
+/** Classify only what the command and current executable identity establish. */
+export const classifyClientRegistrationCommand = (
+  command: readonly string[],
+  currentCommandPath: string | undefined,
+): ClientRegistrationCommandIdentity => {
+  const packageReference = clientRegistrationPackageReference(command);
+  if (packageReference !== undefined)
+    return isOwnedClientRegistrationCommand(command, currentCommandPath)
+      ? "owned"
+      : "foreign";
+  const currentPathAvailable =
+    currentCommandPath !== undefined && currentCommandPath.length > 0;
+  const nodeScript = command.length === 3 && command[2] === "mcp";
+  if (nodeScript) {
+    if (
+      !isAbsolute(command[0] ?? "") ||
+      !isAbsolute(command[1] ?? "") ||
+      !currentPathAvailable
+    )
+      return "unknown";
+    return isOwnedClientRegistrationCommand(command, currentCommandPath)
+      ? "owned"
+      : "foreign";
+  }
+  if (command.length === 2 && command[1] === "mcp") {
+    const executable = command[0] ?? "";
+    if (executable === PRODUCT_IDENTITY.cliBinary) return "owned";
+    const relativePathLike =
+      !isAbsolute(executable) && /[./\\]/u.test(executable);
+    if (relativePathLike || (isAbsolute(executable) && !currentPathAvailable))
+      return "unknown";
+  }
+  if (isOwnedClientRegistrationCommand(command, currentCommandPath))
+    return "owned";
+  return "foreign";
+};
+
 export const isOwnedClientRegistrationCommand = (
   command: readonly string[],
-  currentCommandPath: string = resolve(process.argv[1] ?? "unknown"),
+  currentCommandPath: string | undefined,
 ): boolean => {
   if (
+    currentCommandPath !== undefined &&
+    currentCommandPath.length > 0 &&
     command.length === 3 &&
     command[2] === "mcp" &&
+    isAbsolute(command[0] ?? "") &&
+    isAbsolute(command[1] ?? "") &&
     resolve(command[0] ?? "") === resolve(process.execPath) &&
     resolve(command[1] ?? "") === currentCommandPath
   )
@@ -123,13 +172,14 @@ export const isOwnedClientRegistrationCommand = (
     if (
       executable === PRODUCT_IDENTITY.cliBinary ||
       (isAbsolute(executable) &&
-        basename(executable) === PRODUCT_IDENTITY.cliBinary) ||
-      resolve(executable) === currentCommandPath
+        currentCommandPath !== undefined &&
+        currentCommandPath.length > 0 &&
+        resolve(executable) === currentCommandPath)
     )
       return true;
   }
 
-  const packageReference = packageRunnerReference(unwrapCmdCommand(command));
+  const packageReference = clientRegistrationPackageReference(command);
   return (
     packageReference !== undefined && isOwnedPackageReference(packageReference)
   );

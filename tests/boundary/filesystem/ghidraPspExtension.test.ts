@@ -46,15 +46,18 @@ const target = {
     byteOrder: "little",
     type: 2,
     flags: 0x10a23001,
+    gnuAttributes: null,
     abiFlags: pspAbiFlags,
   },
 } satisfies BinaryTarget;
 const host: GhidraInstallationHost = {
   platform: "linux",
   architecture: "x64",
-  readText: () => "application.version=12.1.3\n",
+  readText: () => "application.version=12.1.3\napplication.java.min=21\n",
   executable: () => true,
   probeJava: () => ({
+    osArch: "amd64",
+    osName: "Linux",
     version: "21.0.12",
     major: 21,
     home: "/jdk-21",
@@ -191,12 +194,9 @@ describe.skipIf(process.platform === "win32")(
     it.each([
       ["name=other\nversion=12.1.3\n", "does not match"],
       ["name=ghidra-allegrex\nversion=12.1.4\n", "does not match"],
-      [
-        "name=ghidra-allegrex\nversion=12.1.3\nversion=12.1.3\n",
-        "exactly one version",
-      ],
+      ["name=ghidra-allegrex\nversion=12.1.\\uZZZZ\n", "Unicode escape"],
     ])(
-      "rejects incompatible or ambiguous extension metadata %s",
+      "rejects mismatched or malformed extension metadata %s",
       async (properties, reason) => {
         const { root } = await installation();
         await writeFile(join(root, "extension.properties"), properties);
@@ -313,6 +313,16 @@ describe.skipIf(process.platform === "win32")(
         expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
       },
     );
+
+    it("refuses a separately declared unsupported MSA argument ABI", async () => {
+      const { provider } = await installation();
+      const altered = {
+        ...target,
+        mips: { ...target.mips, gnuAttributes: { fpAbi: 2, msa: 1 } },
+      } as BinaryTarget;
+      expect(ghidraProcessorUnsupportedReason(altered)).toMatch(/MSA ABI/u);
+      expect(provider.inspectTargetSupport(altered).status).toBe("unsupported");
+    });
   },
 );
 
@@ -389,6 +399,7 @@ describe.skipIf(process.platform === "win32")(
             byteOrder: "little",
             type: 2,
             flags: 0x10a23001,
+            gnuAttributes: null,
             abiFlags: { ...pspAbiFlags, [field]: value },
           },
         };
@@ -417,6 +428,7 @@ describe.skipIf(process.platform === "win32")(
             byteOrder: "little",
             type: 2,
             flags: 0x10a23001,
+            gnuAttributes: null,
             ...(abiFlags === undefined ? {} : { abiFlags }),
           },
         };
@@ -502,5 +514,40 @@ describe.skipIf(process.platform === "win32")(
         "Allegrex:LE:32:default",
       );
     });
+  },
+);
+
+describe.skipIf(process.platform === "win32")(
+  "PSP extension property syntax",
+  () => {
+    it.each([
+      {
+        form: "escaped key and value with colon separator",
+        properties: "n\\u0061me : ghidra-allegrex\nver\\u0073ion=12.1.3\n",
+      },
+      {
+        form: "continued key and value lines",
+        properties: "name=ghidra-\\\n allegrex\nversion=12.1.\\\n 3\n",
+      },
+      {
+        form: "duplicate keys use the last value",
+        properties:
+          "name=wrong\nname=ghidra-allegrex\nversion=12.1.4\nversion=12.1.3\n",
+      },
+    ])(
+      "accepts Java Properties $form and hashes raw bytes",
+      async ({ properties }) => {
+        const { root } = await installation();
+        const canonical = await inspectGhidraPspExtension(root, "12.1.3");
+        const latin1Properties = Buffer.from(
+          `${properties}author=caf\u00e9\n`,
+          "latin1",
+        );
+        await writeFile(join(root, "extension.properties"), latin1Properties);
+        const extension = await inspectGhidraPspExtension(root, "12.1.3");
+        expect(extension.id).toBe("ghidra-allegrex");
+        expect(extension.sha256).not.toBe(canonical.sha256);
+      },
+    );
   },
 );

@@ -14,7 +14,6 @@ const boundedRelativePathSchema = z
   .refine(
     (path) =>
       !path.startsWith("/") &&
-      !path.includes("\\") &&
       path.split("/").every((part) => part !== "" && part !== ".."),
     "Expected a normalized relative POSIX path without traversal",
   );
@@ -101,7 +100,7 @@ const artifactCommandSchema = z.object({
 export type ArtifactCommand = z.infer<typeof artifactCommandSchema>;
 
 /** One content-addressed application artifact in deterministic manifest order. */
-const artifactNodeSchema = z.object({
+export const artifactNodeSchema = z.object({
   artifact_id: artifactIdSchema,
   format: artifactContentFormatSchema,
   sha256: sha256Schema,
@@ -113,7 +112,7 @@ const artifactNodeSchema = z.object({
 });
 
 /** One path or virtual location where an artifact occurs in its parent. */
-const artifactOccurrenceSchema = z.object({
+export const artifactOccurrenceSchema = z.object({
   occurrence_id: occurrenceIdSchema,
   artifact_id: artifactIdSchema.nullable(),
   parent_occurrence_id: occurrenceIdSchema.nullable(),
@@ -159,7 +158,7 @@ export const integrityContradictionSchema = z.object({
  * Parent-child derivation relation between two content-addressed artifacts.
  * The child artifact and its logical path are those of the edge's occurrence.
  */
-const artifactEdgeSchema = z.object({
+export const artifactEdgeSchema = z.object({
   edge_id: edgeIdSchema,
   ordinal: z.number().int().min(0),
   parent_artifact_id: artifactIdSchema,
@@ -177,7 +176,7 @@ const artifactEdgeSchema = z.object({
 });
 
 /** Stable cryptographic commitment and counts for a complete artifact graph. */
-const artifactGraphManifestSchema = z.object({
+export const artifactGraphManifestSchema = z.object({
   manifest_id: manifestIdSchema,
   root_artifact_id: artifactIdSchema,
   root_sha256: sha256Schema,
@@ -188,6 +187,15 @@ const artifactGraphManifestSchema = z.object({
   edge_count: z.number().int().min(0),
 });
 
+/** Producer-owned traversal coverage; content certainty remains on each occurrence. */
+export const artifactInventoryCoverageSchema = z.strictObject({
+  scope: z.enum(["root", "container-entries"]),
+  status: z.enum(["complete", "unknown"]),
+});
+export type ArtifactInventoryCoverage = z.infer<
+  typeof artifactInventoryCoverageSchema
+>;
+
 /** Complete inventory observation containing the stable artifact graph. */
 export const artifactInventoryResultSchema = z.object({
   manifest: artifactGraphManifestSchema,
@@ -196,8 +204,23 @@ export const artifactInventoryResultSchema = z.object({
   edges: z.array(artifactEdgeSchema),
   provenance: z.array(artifactCommandSchema),
   integrity_contradictions: z.array(integrityContradictionSchema).default([]),
+  // Omitted by older retained Evidence; the inventory parser owns its compatibility policy.
+  coverage: artifactInventoryCoverageSchema.optional(),
   limitations: z.array(z.string()),
+  /** Optional only for persisted inventory Evidence written before this field. */
+  coverage_status: z.enum(["complete", "partial"]).optional(),
 });
+
+/** Current producers always declare coverage; historical Evidence inputs may omit it. */
+export const artifactInventoryOutputSchema =
+  artifactInventoryResultSchema.safeExtend({
+    coverage: artifactInventoryCoverageSchema,
+    coverage_status:
+      artifactInventoryResultSchema.shape.coverage_status.unwrap(),
+  });
+export type ArtifactInventoryOutput = z.infer<
+  typeof artifactInventoryOutputSchema
+>;
 
 /** One safely materialized artifact beneath caller-approved output root. */
 const extractedArtifactSchema = z.object({

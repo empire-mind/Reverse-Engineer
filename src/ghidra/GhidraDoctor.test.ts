@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runDoctor, type DoctorHost } from "../application/Doctor.js";
 import { createDoctorHostFixture } from "../application/Doctor.fixture.js";
 import { providerRegistrationEnvironment } from "../application/SetupRegistrationEnvironment.js";
 import { WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON } from "../process/WindowsAuthority.js";
+import * as nativeLoader from "../windows/WindowsNativeLoader.js";
 import {
   inspectGhidraInstallation,
   type GhidraInstallationHost,
@@ -14,10 +15,13 @@ import { projectGhidraDoctorInspection } from "./GhidraDoctor.js";
 const INSTALL = "/opt/ghidra_12.1.4_PUBLIC";
 const installationHost = (
   overrides: Partial<GhidraInstallationHost> = {},
+  platform: NodeJS.Platform = "linux",
 ): GhidraInstallationHost => ({
-  readText: () => "application.version=12.1.4\n",
+  readText: () => "application.version=12.1.4\napplication.java.min=21\n",
   executable: () => true,
   probeJava: () => ({
+    osArch: "amd64",
+    osName: platform === "win32" ? "Windows 11" : "Linux",
     version: "21.0.11",
     major: 21,
     home: "/usr/lib/jvm/jdk-21",
@@ -44,7 +48,7 @@ const inspection = (
         ? {}
         : { installDir: options.installDir }),
     },
-    installationHost(overrides),
+    installationHost(overrides, options.platform ?? "linux"),
   );
 
 const doctorHost = (
@@ -60,7 +64,7 @@ const doctorHost = (
         id: "ubuntu",
         versionId: "24.04",
         packageFamily: "deb",
-        supported: true,
+        hopperSetupSupported: true,
       }),
     validTarget: () => Promise.resolve(true),
     executable: (path) =>
@@ -111,7 +115,9 @@ describe("Ghidra doctor integration", () => {
       "wrong version",
       inspection(
         { installDir: INSTALL },
-        { readText: () => "application.version=11.4\n" },
+        {
+          readText: () => "application.version=11.4\napplication.java.min=21\n",
+        },
       ),
       "ghidra-version",
     ],
@@ -126,6 +132,8 @@ describe("Ghidra doctor integration", () => {
         { installDir: INSTALL },
         {
           probeJava: () => ({
+            osArch: "amd64",
+            osName: "Linux",
             version: "17.0.12",
             major: 17,
             home: "/usr/lib/jvm/jdk-17",
@@ -133,6 +141,14 @@ describe("Ghidra doctor integration", () => {
             runtime: "jdk",
           }),
         },
+      ),
+      "ghidra-java",
+    ],
+    [
+      "missing Java minimum",
+      inspection(
+        { installDir: INSTALL },
+        { readText: () => "application.version=12.1.4\n" },
       ),
       "ghidra-java",
     ],
@@ -163,6 +179,14 @@ describe("Ghidra doctor integration", () => {
 });
 
 describe("Windows Ghidra doctor authority", () => {
+  beforeEach(() => {
+    vi.spyOn(nativeLoader, "systemWindowsNativeAuthority").mockReturnValue({
+      available: false,
+      failureStage: "artifact",
+      reason: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
   it("distinguishes a valid Windows installation from unavailable native authority", async () => {
     const ghidra = inspection({
       installDir: "C:\\tools\\ghidra_12.1.4_PUBLIC",
@@ -202,9 +226,9 @@ describe("Windows Ghidra doctor authority", () => {
       result.checks.find(({ name }) => name === "ghidra-native_authority"),
     ).toMatchObject({
       ok: false,
-      classification: "unsupported_host",
+      classification: "missing_dependency",
       detail: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
-      remediation: expect.stringContaining("cannot enable"),
+      remediation: expect.stringContaining("matching Windows x64 REA package"),
     });
   });
 
@@ -226,7 +250,109 @@ describe("Windows Ghidra doctor authority", () => {
     expect(result.scope_checks).toContainEqual(
       expect.objectContaining({
         name: "ghidra-native_authority",
-        classification: "unsupported_host",
+        classification: "missing_dependency",
+        detail: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
+      }),
+    );
+  });
+});
+
+describe("Windows native doctor failure diagnostics", () => {
+  beforeEach(() => {
+    vi.spyOn(nativeLoader, "systemWindowsNativeAuthority").mockReturnValue({
+      available: false,
+      failureStage: "artifact",
+      reason: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ["host", "unsupported_host", "unsupported_host", "Windows x64 host"],
+    [
+      "artifact",
+      "runtime_missing",
+      "missing_dependency",
+      "bundled native addon",
+    ],
+    [
+      "self-test",
+      "runtime_unavailable",
+      "runtime_failure",
+      "preserved native self-test error",
+    ],
+    [
+      "inspection",
+      "runtime_unavailable",
+      "runtime_failure",
+      "every required security control",
+    ],
+  ] as const)(
+    "projects %s failure without blaming Ghidra",
+    async (failureStage, code, classification, remediation) => {
+      const reason =
+        "Windows native failure: remove_owned_directory: directory is not empty (145)";
+      const load = vi.mocked(nativeLoader.systemWindowsNativeAuthority);
+      load.mockReturnValue({ available: false, failureStage, reason });
+      const result = await runDoctor(
+        undefined,
+        {
+          ...doctorHost(inspection({ installDir: INSTALL, platform: "win32" })),
+          platform: "win32",
+          linuxDistribution: () => Promise.resolve(undefined),
+        },
+        { providers: ["ghidra"] },
+      );
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(result.healthy).toBe(false);
+      expect(result.providerInspections?.[0]).toMatchObject({
+        available: false,
+        registrationEnvironment: { GHIDRA_INSTALL_DIR: INSTALL },
+        checks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "native_authority",
+            ok: false,
+            code,
+            detail: reason,
+          }),
+        ]),
+      });
+      expect(result.scope_checks).toContainEqual(
+        expect.objectContaining({
+          name: "ghidra-native_authority",
+          classification,
+          detail: reason,
+          remediation: expect.stringContaining(remediation),
+        }),
+      );
+    },
+  );
+
+  it("keeps one failure observation even when the next query would differ", () => {
+    const load = vi.mocked(nativeLoader.systemWindowsNativeAuthority);
+    load.mockReturnValueOnce({
+      available: false,
+      failureStage: "self-test",
+      retryable: true,
+      reason: "cleanup failed (145)",
+    });
+    const ghidra = inspection({ installDir: INSTALL, platform: "win32" });
+    const failed = projectGhidraDoctorInspection(ghidra);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(failed.checks).toContainEqual(
+      expect.objectContaining({
+        name: "native_authority",
+        ok: false,
+        code: "runtime_unavailable",
+        detail: "cleanup failed (145)",
+      }),
+    );
+    const later = projectGhidraDoctorInspection(ghidra);
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(later.checks).toContainEqual(
+      expect.objectContaining({
+        name: "native_authority",
+        code: "runtime_missing",
         detail: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
       }),
     );

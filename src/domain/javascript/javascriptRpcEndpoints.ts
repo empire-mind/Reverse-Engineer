@@ -122,31 +122,79 @@ const objectKeys = (node: t.Node | undefined): readonly string[] =>
       })
     : [];
 
-const objectStringProperty = (
-  node: t.ObjectExpression,
-  key: string,
-): string | undefined => {
-  for (const property of node.properties)
-    if (
-      t.isObjectProperty(property) &&
-      semanticStaticPropertyKey(property.key, property.computed) === key &&
-      t.isStringLiteral(property.value)
-    )
-      return property.value.value;
-  return undefined;
-};
-
+/** Later properties own a key; an intervening dynamic write leaves it unknown. */
 const objectProperty = (
   node: t.ObjectExpression,
   key: string,
 ): t.Node | undefined => {
-  for (const property of node.properties)
-    if (
-      t.isObjectProperty(property) &&
-      semanticStaticPropertyKey(property.key, property.computed) === key
-    )
-      return property.value;
+  for (let index = node.properties.length - 1; index >= 0; index -= 1) {
+    const property = node.properties[index];
+    if (property === undefined || t.isSpreadElement(property)) return undefined;
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) return undefined;
+    if (name === key)
+      return t.isObjectProperty(property) ? property.value : undefined;
+  }
   return undefined;
+};
+
+const objectStringProperty = (
+  node: t.ObjectExpression,
+  key: string,
+): string | undefined => {
+  const value = objectProperty(node, key);
+  return t.isStringLiteral(value) ? value.value : undefined;
+};
+
+/**
+ * Find source-body string values owned by a GraphQL Source-shaped literal.
+ * A later duplicate or spread can make the effective `body` unknown, but the
+ * earlier strings still belong to this object and must not become standalone
+ * operation findings during the string scan.
+ */
+const graphqlSourceBodyLiterals = (
+  node: t.ObjectExpression,
+): readonly t.StringLiteral[] | undefined => {
+  const bodyStrings = (object: t.ObjectExpression) =>
+    object.properties.flatMap((property) =>
+      t.isObjectProperty(property) &&
+      semanticStaticPropertyKey(property.key, property.computed) === "body" &&
+      t.isStringLiteral(property.value)
+        ? [property.value]
+        : [],
+    );
+  const bodies = bodyStrings(node);
+  const hasLocationOffset = node.properties.some(
+    (property) =>
+      t.isObjectProperty(property) &&
+      semanticStaticPropertyKey(property.key, property.computed) ===
+        "locationOffset",
+  );
+  if (!hasLocationOffset) return undefined;
+
+  // Inline object spreads can own additional body values which the surrounding
+  // Source object may select. Include only body-key string literals from those
+  // spread values; ordinary strings elsewhere in the object remain scannable.
+  const visited = new WeakSet<t.ObjectExpression>();
+  visited.add(node);
+  const pending = node.properties.flatMap((property) => {
+    if (!t.isSpreadElement(property)) return [];
+    const spread = unwrapJavaScriptExpression(property.argument).node;
+    return t.isObjectExpression(spread) ? [spread] : [];
+  });
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || visited.has(current)) continue;
+    visited.add(current);
+    bodies.push(...bodyStrings(current));
+    for (const property of current.properties) {
+      if (t.isSpreadElement(property)) {
+        const spread = unwrapJavaScriptExpression(property.argument).node;
+        if (t.isObjectExpression(spread)) pending.push(spread);
+      }
+    }
+  }
+  return bodies.length === 0 ? undefined : bodies;
 };
 
 const GRAPHQL_OPERATION_TYPES: ReadonlySet<string> = new Set([
@@ -154,22 +202,21 @@ const GRAPHQL_OPERATION_TYPES: ReadonlySet<string> = new Set([
   "mutation",
   "subscription",
 ]);
-// A named GraphQL operation header (GraphQL October 2021, OperationDefinition):
-// type, name, then variable definitions starting with `$`, a directive, or a
-// selection set starting with a field name.
-const GRAPHQL_OPERATION_HEADER =
-  /^(query|mutation|subscription)[\s,]+([_A-Za-z][_0-9A-Za-z]*)[\s,]*(?:\([\s,]*\$|@[_A-Za-z]|\{[\s,]*[_A-Za-z])/u;
 
+// GraphQL October 2021 §2.1.7: ignored BOM, tab/space, line endings, commas;
+// comments are consumed separately below.
 const isGraphqlIgnoredCharacter = (character: string): boolean =>
-  character === "," || character === "﻿" || /\s/u.test(character);
+  character === "," ||
+  character === "\uFEFF" ||
+  character === "\t" ||
+  character === " " ||
+  character === "\n" ||
+  character === "\r";
 
-/** Recover a named operation from GraphQL document text. */
-export const graphqlOperationFromText = (
-  text: string,
-): JavaScriptRpcEndpoint | undefined => {
-  // Skip GraphQL ignored tokens: whitespace, commas, BOM and # comments.
+/** Return the first offset after GraphQL ignored tokens. */
+const skipGraphqlIgnored = (text: string, start: number): number => {
   const limit = text.length;
-  let index = 0;
+  let index = start;
   while (index < limit) {
     const character = text.charAt(index);
     if (isGraphqlIgnoredCharacter(character)) index += 1;
@@ -177,13 +224,40 @@ export const graphqlOperationFromText = (
       while (index < limit && !/[\n\r]/u.test(text.charAt(index))) index += 1;
     } else break;
   }
-  if (index >= limit) return undefined;
-  const header = GRAPHQL_OPERATION_HEADER.exec(text.slice(index));
-  const type = header?.[1];
-  const name = header?.[2];
-  return type === undefined || name === undefined
+  return index;
+};
+
+const graphqlNameAt = (
+  text: string,
+  index: number,
+): { readonly value: string; readonly end: number } | undefined => {
+  const name = /^[_A-Za-z][_0-9A-Za-z]*/u.exec(text.slice(index))?.[0];
+  return name === undefined
     ? undefined
-    : { value: name, mechanism: `graphql:${type}` };
+    : { value: name, end: index + name.length };
+};
+
+/** Recover a named operation from GraphQL document text. */
+export const graphqlOperationFromText = (
+  text: string,
+): JavaScriptRpcEndpoint | undefined => {
+  const type = graphqlNameAt(text, skipGraphqlIgnored(text, 0));
+  if (type === undefined || !GRAPHQL_OPERATION_TYPES.has(type.value))
+    return undefined;
+  const name = graphqlNameAt(text, skipGraphqlIgnored(text, type.end));
+  if (name === undefined) return undefined;
+  const index = skipGraphqlIgnored(text, name.end);
+  const next = text.charAt(index);
+  // Keep the existing bounded recognition scope: a named operation followed
+  // by variable definitions, a directive, or a selection set with a field.
+  const hasHeader =
+    next === "("
+      ? text.charAt(skipGraphqlIgnored(text, index + 1)) === "$"
+      : (next === "@" || next === "{") &&
+        graphqlNameAt(text, skipGraphqlIgnored(text, index + 1)) !== undefined;
+  return hasHeader
+    ? { value: name.value, mechanism: `graphql:${type.value}` }
+    : undefined;
 };
 
 /** Recover a named operation from a precompiled GraphQL document object. */
@@ -258,9 +332,10 @@ export const createJavaScriptRpcScan = (
   let marker: boolean | undefined;
   const hasMarker = (): boolean =>
     (marker ??= TRPC_SOURCE_MARKERS.some((value) => source.includes(value)));
-  // graphql-tag documents retain their source text in loc.source.body; that
-  // text repeats the OperationDefinition already recovered from the object.
-  const documentSourceBodies = new WeakSet<t.Node>();
+  // graphql-tag documents retain source text in loc.source.body. Keep each
+  // direct body literal owned by a Source-shaped object out of the independent
+  // string scan, including duplicates that a later property or spread hides.
+  const graphqlDocumentSourceBodies = new WeakSet<t.Node>();
 
   const procedure = (
     node: t.CallExpression | t.OptionalCallExpression,
@@ -295,26 +370,29 @@ export const createJavaScriptRpcScan = (
       if (t.isCallExpression(node) || t.isOptionalCallExpression(node))
         return trpcLinkUrl(node) ?? procedure(node);
       if (t.isObjectExpression(node)) {
-        const body = objectProperty(node, "body");
-        if (
-          t.isStringLiteral(body) &&
-          objectProperty(node, "locationOffset") !== undefined
-        ) {
-          documentSourceBodies.add(body);
+        const bodies = graphqlSourceBodyLiterals(node);
+        if (bodies !== undefined) {
+          for (const body of bodies) graphqlDocumentSourceBodies.add(body);
           return undefined;
         }
         return graphqlOperationFromDocumentNode(node);
       }
       if (t.isStringLiteral(node))
-        return documentSourceBodies.has(node)
+        return graphqlDocumentSourceBodies.has(node)
           ? undefined
           : graphqlOperationFromText(node.value);
       if (t.isTemplateLiteral(node)) {
-        // A template recovered without a cooked value stays dynamic.
-        const cooked = node.quasis[0]?.value.cooked;
-        return cooked === undefined || cooked === null
-          ? undefined
-          : graphqlOperationFromText(cooked);
+        // Interpolations may contain fragment definitions. Continue only
+        // across quasis that contain ignored tokens; prose or dynamic text
+        // before an operation prevents claiming a later operation belongs to
+        // this document prefix.
+        for (const quasi of node.quasis) {
+          const cooked = quasi.value.cooked;
+          if (cooked === undefined || cooked === null) return undefined;
+          if (skipGraphqlIgnored(cooked, 0) === cooked.length) continue;
+          return graphqlOperationFromText(cooked);
+        }
+        return undefined;
       }
       return undefined;
     },

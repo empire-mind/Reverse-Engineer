@@ -11,6 +11,7 @@ import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
 import { isUpdateFailure } from "../application/UpdateFailure.js";
 import {
   confirmInteractiveSetup,
+  renderSetupDryRun,
   renderInteractiveSetupResult,
   renderSetupProgress,
 } from "./interactiveSetup.js";
@@ -225,6 +226,14 @@ const runSetupCommand = async (
       : undefined,
   );
   if (interactive) renderInteractiveSetupResult(result, environment);
+  else if (
+    options.dryRun &&
+    !input.formatExplicit &&
+    hasInteractiveTerminal()
+  ) {
+    if (result.status === "planned") renderSetupDryRun(result.plannedActions);
+    else renderInteractiveSetupResult(result, environment);
+  }
   return result;
 };
 
@@ -282,6 +291,9 @@ const setupIsInteractive = (
   !options.yes &&
   !options.dryRun &&
   !formatExplicit &&
+  hasInteractiveTerminal();
+
+const hasInteractiveTerminal = (): boolean =>
   process.stdin.isTTY === true &&
   process.stdout.isTTY === true &&
   process.stderr.isTTY === true;

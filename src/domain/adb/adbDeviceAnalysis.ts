@@ -30,6 +30,25 @@ const packageNameSchema = z
     "Package name must be dot-separated Java identifiers",
   );
 
+/** Text states emitted by adb's ConnectionState formatter. */
+export const ADB_DEVICE_STATES = [
+  "no permissions",
+  "unauthorized",
+  "authorizing",
+  "offline",
+  "recovery",
+  "sideload",
+  "connecting",
+  "bootloader",
+  "device",
+  "unknown",
+  "host",
+  "rescue",
+  "detached",
+] as const;
+export const adbDeviceStateSchema = z.enum(ADB_DEVICE_STATES);
+export type AdbDeviceState = (typeof ADB_DEVICE_STATES)[number];
+
 const keyStringSchema = z.string().min(1).max(256);
 const keyPattern = /^[A-Za-z0-9._\x2d]+$/u;
 
@@ -215,7 +234,7 @@ export const adbInputSchemas = {
       .boolean()
       .default(false)
       .describe(
-        "Replace an existing installation and keep its data (adb install -r)",
+        "Request replacement mode and keep existing app data if present (adb install -r); does not establish whether the app was already installed",
       ),
   }),
   uninstall_adb_package: z.strictObject({
@@ -412,7 +431,7 @@ const client = z.strictObject({
 
 const device = z.strictObject({
   serial: z.string().min(1),
-  state: z.string().min(1),
+  state: adbDeviceStateSchema,
   transport: z.enum(["usb", "tcp", "unknown"]),
   product: z.string().nullable(),
   model: z.string().nullable(),
@@ -666,7 +685,8 @@ export const adbResultSchemas = {
     apk_path: z.string().min(1),
     bytes: z.number().int().nonnegative(),
     sha256: z.string().regex(/^[a-f0-9]{64}$/u),
-    replaced: z.boolean(),
+    replace_requested: z.boolean(),
+    replaced: z.boolean().nullable(),
   }),
   uninstall_adb_package: z.strictObject({
     client,
@@ -679,6 +699,8 @@ export const adbResultSchemas = {
     package_name: packageNameSchema,
     component: z.string().min(1),
     started_activity: z.string().nullable(),
+    reported_activity: z.string().nullable().optional(),
+    reported_status: z.string().nullable().optional(),
   }),
   start_adb_activity: z.strictObject({
     client,
@@ -694,6 +716,8 @@ export const adbResultSchemas = {
       }),
     ),
     started_activity: z.string().nullable(),
+    reported_activity: z.string().nullable().optional(),
+    reported_status: z.string().nullable().optional(),
   }),
   stop_adb_app: z.strictObject({
     client,
@@ -702,6 +726,19 @@ export const adbResultSchemas = {
   }),
 } as const;
 
+/** Launch-attempt facts retained when Activity Manager does not report success. */
+export type AdbActivityStartPartialObservation =
+  | {
+      readonly provider_id: "adb";
+      readonly operation: "start_adb_app";
+      readonly result: z.infer<typeof adbResultSchemas.start_adb_app>;
+    }
+  | {
+      readonly provider_id: "adb";
+      readonly operation: "start_adb_activity";
+      readonly result: z.infer<typeof adbResultSchemas.start_adb_activity>;
+    };
+
 /** Acquired package facts retained when cancellation leaves caller-owned output. */
 export type AdbPackagePullPartialObservation = {
   readonly provider_id: "adb";
@@ -709,7 +746,7 @@ export type AdbPackagePullPartialObservation = {
   readonly result: z.infer<typeof adbResultSchemas.pull_adb_package>;
 };
 
-/** A completed acquisition whose digest read was cancelled before verification. */
+/** Acquired file facts retained when publication, digest verification or cleanup fails. */
 export type AdbAcquiredFilePartialObservation =
   | {
       readonly provider_id: "adb";
@@ -727,13 +764,15 @@ export type AdbAcquiredFilePartialObservation =
   | {
       readonly provider_id: "adb";
       readonly operation: "collect_adb_bugreport";
-      readonly result: {
-        readonly client: z.infer<
-          typeof adbResultSchemas.collect_adb_bugreport
-        >["client"];
-        readonly serial: string;
-        readonly local_path: string;
-        readonly adb_reported_path: string;
-        readonly digest_status: "unknown";
-      };
+      readonly result:
+        | z.infer<typeof adbResultSchemas.collect_adb_bugreport>
+        | {
+            readonly client: z.infer<
+              typeof adbResultSchemas.collect_adb_bugreport
+            >["client"];
+            readonly serial: string;
+            readonly local_path: string;
+            readonly adb_reported_path: string;
+            readonly digest_status: "unknown";
+          };
     };

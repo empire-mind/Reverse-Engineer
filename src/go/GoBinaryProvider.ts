@@ -1,5 +1,7 @@
 import { readStableArtifact } from "../artifacts/readStableArtifact.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import type { ExecutionOptions } from "../application/AnalysisProvider.js";
 import type { GoBinaryPort } from "../application/go/GoBinaryPort.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -18,6 +20,7 @@ import {
   type InspectGoBinaryInput,
 } from "../domain/go/goBinary.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   readGoBinaryImage,
@@ -36,17 +39,23 @@ const OPERATION = "inspect_go_binary";
 const INPUT_BYTES = 256 * 1024 * 1024;
 const OUTPUT_BYTES = 8 * 1024 * 1024;
 
-const failureFor = (
+const failureForPrimary = (
   cause: unknown,
   path: string,
   signal?: AbortSignal,
 ): AnalysisError => {
   if (cause instanceof AnalysisError) return cause;
-  if (signal?.aborted) return new AnalysisCancelledError(OPERATION);
+  if (cause instanceof ArtifactReaderFailure && cause.reason === "integrity")
+    return new AnalysisArtifactChangedError(OPERATION, path, cause.message, {
+      cause,
+    });
+  if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+    return new AnalysisCancelledError(OPERATION, { cause });
+  if (signal?.aborted) return new AnalysisCancelledError(OPERATION, { cause });
   if (cause instanceof GoBinaryResourceFailure)
     return new AnalysisResourceConstraintError(
       OPERATION,
-      "memory",
+      cause.boundary === "search" ? "cpu" : "memory",
       `Selected artifact ${path}: ${cause.message}`,
       { boundary: cause.boundary, maximum_bytes: cause.maximum_bytes },
       { cause },
@@ -64,12 +73,6 @@ const failureFor = (
           },
         ]);
   if (cause instanceof ArtifactReaderFailure) {
-    if (cause.reason === "integrity")
-      return new AnalysisArtifactChangedError(OPERATION, path, cause.message, {
-        cause,
-      });
-    if (cause.reason === "cancelled")
-      return new AnalysisCancelledError(OPERATION);
     if (cause.reason === "limit")
       return new AnalysisResourceConstraintError(
         OPERATION,
@@ -110,6 +113,23 @@ const failureFor = (
   });
 };
 
+const failureFor = (
+  cause: unknown,
+  path: string,
+  signal?: AbortSignal,
+): AnalysisError => {
+  const primary = failureForPrimary(cause, path, signal);
+  if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
+    return primary;
+  const cleanup = new ProviderCleanupError(
+    GO_BINARY_PROVIDER_IDENTITY.id,
+    cause.cleanup.resources,
+    { reason: cause.cleanup.reason },
+    { operation: OPERATION, cause },
+  );
+  return analysisErrorWithCleanupFailure(primary, cleanup, OPERATION);
+};
+
 const outputLimit = (path: string) =>
   new AnalysisResourceConstraintError(
     OPERATION,
@@ -121,6 +141,11 @@ const outputLimit = (path: string) =>
 /** Stable in-process metadata inspection without subprocesses, temporary files or Go installation. */
 export class GoBinaryProvider implements GoBinaryPort {
   readonly identity = GO_BINARY_PROVIDER_IDENTITY;
+  readonly #resources = new ArtifactResourceScope();
+
+  close(): Promise<void> {
+    return this.#resources.close();
+  }
 
   /** Read complete compiler/module metadata while preserving original byte identity and source ranges. */
   async inspect(
@@ -128,10 +153,14 @@ export class GoBinaryProvider implements GoBinaryPort {
     options?: ExecutionOptions,
   ): Promise<Result<GoBinary, AnalysisError>> {
     try {
-      const snapshot = await readStableArtifact(
-        input.path,
-        INPUT_BYTES,
-        options?.signal,
+      const snapshot = await this.#resources.run(() =>
+        readStableArtifact(
+          input.path,
+          INPUT_BYTES,
+          options?.signal,
+          undefined,
+          this.#resources,
+        ),
       );
       options?.signal?.throwIfAborted();
       const image = readGoBinaryImage(snapshot.bytes);
@@ -165,7 +194,7 @@ export class GoBinaryProvider implements GoBinaryPort {
         limitations: [
           "Embedded build metadata is observed file content, not proof of compiler identity, dependency authenticity or runtime behavior.",
           "Only Go build information is inspected; function names, source mappings, type metadata and decompiled code are not recovered.",
-          "Resource guards bound stable artifact reads to 256 MiB, aggregate embedded strings to 1 MiB, structural table decoding to 16 MiB and complete metadata payloads to 8 MiB; these are not operating-system memory or CPU limits.",
+          "Resource guards bound stable artifact reads and cumulative header searches to 256 MiB each, aggregate embedded strings to 1 MiB, structural table decoding to 16 MiB and complete metadata payloads to 8 MiB; these are not operating-system memory or CPU limits.",
           ...(info !== null &&
           (info.go_version === null || info.module_text === null)
             ? [

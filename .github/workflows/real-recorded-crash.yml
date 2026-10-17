@@ -3,13 +3,15 @@ name: Real recorded crash evidence
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      build_cache_artifact:
+        description: Portable build cache artifact from the calling CI run.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
-
-concurrency:
-  group: real-recorded-crash-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 env:
   NODE_OPTIONS: --max-old-space-size=768
@@ -23,13 +25,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
-          cache: npm
+      - name: Cache npm package downloads
+        id: npm-cache
+        uses: ./.github/actions/npm-cache
       - run: npm ci
       - uses: ./.github/actions/portable-build-cache
+        with:
+          build_cache_artifact: ${{ inputs.build_cache_artifact }}
       - name: Install GDB on the disposable CI runner
         shell: bash
         run: |

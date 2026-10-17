@@ -52,6 +52,9 @@ export const projectAnalysisError = (
   const primaryDetails = errorDetails(error);
   const details = {
     ...primaryDetails,
+    ...(error.diagnostics === undefined
+      ? {}
+      : { diagnostics: error.diagnostics }),
     ...(error.cleanupIncomplete
       ? {
           cleanup: "incomplete",
@@ -78,7 +81,13 @@ export const projectAnalysisError = (
     code,
     category: analysisErrorCategory(error),
     message: analysisErrorUserMessage(error),
-    retryable: RETRYABLE_CODES.has(code),
+    retryable:
+      RETRYABLE_CODES.has(code) ||
+      (error instanceof AnalysisCapabilityUnavailableError &&
+        error.retryable) ||
+      (code === "resource_constraint" &&
+        error instanceof AnalysisResourceConstraintError &&
+        error.resource === "capacity"),
     remediation: {
       action: analysisErrorRemediationAction(error),
     },
@@ -264,7 +273,13 @@ const requestErrorDetails = (
       boundary: "filesystem-read",
     };
   if (error instanceof AnalysisOutputError)
-    return { operation: error.operation, reason: error.reason };
+    return {
+      operation: error.operation,
+      reason: error.reason,
+      ...(error.diagnostics === undefined
+        ? {}
+        : { diagnostics: error.diagnostics }),
+    };
   if (error instanceof AnalysisInputError && error.issues.length > 0)
     return {
       operation: error.operation,
@@ -354,9 +369,6 @@ const providerErrorDetails = (
             resources: [...error.cleanupResources],
           }
         : {}),
-      ...(error.diagnostics === undefined
-        ? {}
-        : { diagnostics: error.diagnostics }),
     };
   if (error instanceof BrowserObservationError) {
     const primaryReason = primaryBrowserFailureReason(error);
@@ -441,8 +453,8 @@ const lifecycleErrorDetails = (
   if (error instanceof AnalysisCancelledError)
     return {
       operation: error.operation,
-      cleanup: error.cleanup === undefined ? "complete" : "incomplete",
-      ...(error.cleanup === undefined
+      cleanup: error.cleanupIncomplete ? "incomplete" : "complete",
+      ...(error.cleanup === undefined || !error.cleanupIncomplete
         ? {}
         : {
             cleanup_reason: error.cleanup.reason,
@@ -456,7 +468,7 @@ const lifecycleErrorDetails = (
     return {
       operation: error.operation,
       timeout_ms: error.timeoutMs,
-      ...(error.cleanup === undefined
+      ...(error.cleanup === undefined || !error.cleanupIncomplete
         ? {}
         : {
             cleanup: "incomplete",

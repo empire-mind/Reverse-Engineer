@@ -1,37 +1,51 @@
 import { json, run, runWithStatus } from "./lib/verify-package-core.mjs";
 
 /** Run platform-specific deep-analysis smoke tests. */
-export async function verifyPackagePlatform({ cli, environment }) {
-  if (process.platform === "linux") {
+export async function verifyPackagePlatform({
+  cli,
+  environment,
+  platform = process.platform,
+  runCommand = run,
+}) {
+  if (platform === "linux") {
     const unsupportedExecution = await runWithStatus(
       cli,
-      ["analyze", process.execPath, "--json"],
+      ["analyze", process.execPath, "--provider", "hopper", "--json"],
       environment,
     );
     assertLinuxPackageProviderFailure(unsupportedExecution);
   } else {
     const overview = json(
-      await run(cli, ["analyze", process.execPath, "--json"], environment),
+      await runCommand(
+        cli,
+        ["analyze", process.execPath, "--provider", "hopper", "--json"],
+        environment,
+      ),
     );
-    if (
-      overview.operation !== "binary_overview" ||
-      overview.normalized_result?.procedure_count < 1
-    )
+    if (!hasPositiveProcedureCount(overview))
       throw new Error(
         `packaged Hopper-backed analyze CLI failed: ${JSON.stringify(overview)}`,
       );
     const inspected = json(
-      await run(cli, ["inspect", process.execPath, "--json"], environment),
+      await runCommand(
+        cli,
+        ["inspect", process.execPath, "--provider", "hopper", "--json"],
+        environment,
+      ),
     );
-    if (
-      inspected.operation !== "binary_overview" ||
-      inspected.normalized_result?.procedure_count < 1
-    )
+    if (!hasPositiveProcedureCount(inspected))
       throw new Error("packaged inspect CLI failed");
     const functionResult = json(
-      await run(
+      await runCommand(
         cli,
-        ["function", process.execPath, "0x1000", "--json"],
+        [
+          "function",
+          process.execPath,
+          "0x1000",
+          "--provider",
+          "hopper",
+          "--json",
+        ],
         environment,
       ),
     );
@@ -44,9 +58,9 @@ export async function verifyPackagePlatform({ cli, environment }) {
         `packaged function CLI failed: ${JSON.stringify(functionResult)}`,
       );
     const xrefs = json(
-      await run(
+      await runCommand(
         cli,
-        ["xrefs", process.execPath, "0x1000", "--json"],
+        ["xrefs", process.execPath, "0x1000", "--provider", "hopper", "--json"],
         environment,
       ),
     );
@@ -56,9 +70,16 @@ export async function verifyPackagePlatform({ cli, environment }) {
     )
       throw new Error(`packaged xrefs CLI failed: ${JSON.stringify(xrefs)}`);
     const trace = json(
-      await run(
+      await runCommand(
         cli,
-        ["trace", process.execPath, "fixture", "--json"],
+        [
+          "trace",
+          process.execPath,
+          "fixture",
+          "--provider",
+          "hopper",
+          "--json",
+        ],
         environment,
       ),
     );
@@ -93,3 +114,10 @@ export const assertLinuxPackageProviderFailure = (execution) => {
       `packaged Linux Hopper verification did not fail closed: ${JSON.stringify(failure)}`,
     );
 };
+
+const hasPositiveProcedureCount = (result) =>
+  typeof result === "object" &&
+  result !== null &&
+  result.operation === "binary_overview" &&
+  Number.isInteger(result.normalized_result?.procedure_count) &&
+  result.normalized_result.procedure_count > 0;

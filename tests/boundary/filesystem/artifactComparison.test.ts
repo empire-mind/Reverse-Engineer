@@ -1,7 +1,8 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 
 import { fragmentInventoryEvidence } from "../../fixtures/artifactEvidence.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -12,6 +13,7 @@ import {
   artifactComparisonResultSchema,
   compareArtifacts,
 } from "../../../src/domain/artifactComparison.js";
+import { parseArtifactInventoryEvidence } from "../../../src/domain/artifactInventoryEvidence.js";
 import { createEvidence } from "../../../src/domain/evidence.js";
 import { jsonValueSchema } from "../../../src/domain/jsonValue.js";
 
@@ -60,6 +62,216 @@ const changedArtifactComparison = async () => {
     result: compareArtifacts(left, right),
   };
 };
+
+describe("leaf artifact comparison", () => {
+  it("accepts persisted complete leaf inventory Evidence without coverage_status", async () => {
+    const root = await createTestTempDirectory("rea-artifact-plist-compare-");
+    const leftPath = join(root, "left.plist");
+    const rightPath = join(root, "right.plist");
+    const xml =
+      '<?xml version="1.0"?><plist version="1.0"><dict><key>label</key><string>hello</string></dict></plist>';
+    await Promise.all([writeFile(leftPath, xml), writeFile(rightPath, xml)]);
+    const [left, right] = await Promise.all([
+      observe(leftPath),
+      observe(rightPath),
+    ]);
+    // Persisted inventory Evidence predates coverage_status. The known leaf
+    // notice remains complete when normalized at the inventory boundary.
+    const parsed = artifactInventoryResultSchema.parse(left.normalized_result);
+    const {
+      coverage: _coverage,
+      coverage_status: _coverageStatus,
+      ...legacyInventory
+    } = parsed;
+    const legacy = createEvidence(
+      {
+        path: left.subject!.local_path,
+        sha256: left.subject!.digest.sha256,
+        format: left.subject!.format,
+      },
+      PROVIDER,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: jsonValueSchema.parse(legacyInventory),
+        confidence: "observed",
+        authority: "shipped-artifact",
+      },
+    );
+    expect(compareArtifacts(legacy, right)).toMatchObject({
+      status: "unchanged",
+      summary: { unchanged: 1, unknown: 0 },
+      changes: [],
+    });
+  });
+
+  it("keeps content and executable changes visible for complete plist roots", async () => {
+    const root = await createTestTempDirectory("rea-artifact-plist-deltas-");
+    const leftPath = join(root, "left.plist");
+    const rightPath = join(root, "right.plist");
+    const plist = (label: string) =>
+      `<?xml version="1.0"?><plist version="1.0"><dict><key>label</key><string>${label}</string></dict></plist>`;
+    await Promise.all([
+      writeFile(leftPath, plist("hello"), { mode: 0o644 }),
+      writeFile(rightPath, plist("world"), { mode: 0o644 }),
+    ]);
+    const [left, changed] = await Promise.all([
+      observe(leftPath),
+      observe(rightPath),
+    ]);
+    expect(compareArtifacts(left, changed)).toMatchObject({
+      status: "changed",
+      summary: { changed: 1, unknown: 0 },
+      changes: [
+        expect.objectContaining({
+          logical_path: ".",
+          classification: "changed",
+          dimensions: expect.arrayContaining(["content"]),
+        }),
+      ],
+    });
+
+    if (process.platform !== "win32") {
+      await writeFile(rightPath, plist("hello"), { mode: 0o644 });
+      await chmod(rightPath, 0o755);
+      const executable = await observe(rightPath);
+      expect(compareArtifacts(left, executable)).toMatchObject({
+        status: "changed",
+        summary: { changed: 1, unknown: 0 },
+        changes: [
+          expect.objectContaining({
+            logical_path: ".",
+            classification: "changed",
+            dimensions: expect.arrayContaining(["executable"]),
+          }),
+        ],
+      });
+    }
+  });
+});
+
+describe("artifact inventory coverage", () => {
+  it("keeps explicit and legacy unknown coverage fail-closed", async () => {
+    const root = await createTestTempDirectory("rea-artifact-coverage-");
+    const path = join(root, "complete.plist");
+    await writeFile(
+      path,
+      '<?xml version="1.0"?><plist version="1.0"><dict/></plist>',
+    );
+    const complete = await observe(path);
+    const graph = artifactInventoryResultSchema.parse(
+      complete.normalized_result,
+    );
+    const contradictory = createEvidence(
+      {
+        path: complete.subject!.local_path,
+        sha256: complete.subject!.digest.sha256,
+        format: complete.subject!.format,
+      },
+      PROVIDER,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: jsonValueSchema.parse({ ...graph, coverage_status: "partial" }),
+        confidence: "derived",
+        authority: "shipped-artifact",
+      },
+    );
+    expect(() => parseArtifactInventoryEvidence(contradictory)).toThrow(
+      "Artifact inventory has conflicting coverage declarations",
+    );
+
+    const { coverage: _coverage, ...legacyStatusGraph } = graph;
+    const partial = createEvidence(
+      {
+        path: complete.subject!.local_path,
+        sha256: complete.subject!.digest.sha256,
+        format: complete.subject!.format,
+      },
+      PROVIDER,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: jsonValueSchema.parse({
+          ...legacyStatusGraph,
+          coverage_status: "partial",
+        }),
+        confidence: "observed",
+        authority: "shipped-artifact",
+      },
+    );
+    expect(parseArtifactInventoryEvidence(partial).inventory.complete).toBe(
+      true,
+    );
+    expect(compareArtifacts(partial, partial)).toMatchObject({
+      status: "unknown",
+      summary: { unchanged: 0, unknown: 1 },
+    });
+
+    const { coverage_status: _coverageStatus, ...legacyGraph } =
+      legacyStatusGraph;
+    const unknownLegacy = createEvidence(
+      {
+        path: complete.subject!.local_path,
+        sha256: complete.subject!.digest.sha256,
+        format: complete.subject!.format,
+      },
+      PROVIDER,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: jsonValueSchema.parse({
+          ...legacyGraph,
+          limitations: ["Producer omitted unexamined child entries."],
+        }),
+        confidence: "observed",
+        authority: "shipped-artifact",
+      },
+    );
+    expect(compareArtifacts(unknownLegacy, unknownLegacy)).toMatchObject({
+      status: "unknown",
+      summary: { unchanged: 0, unknown: 1 },
+    });
+  });
+
+  it("rejects inventory fragments that disagree on producer coverage", async () => {
+    const parent = await createTestTempDirectory("rea-artifact-page-coverage-");
+    const path = join(parent, "fixture.app");
+    await mkdir(path);
+    await writeFile(join(path, "main.js"), "main();");
+    const source = await observe(path);
+    const fragments = fragmentInventoryEvidence(source, 2);
+    const firstFragment = fragments[0];
+    const fragment = fragments[1];
+    if (firstFragment === undefined || fragment === undefined)
+      throw new Error("Missing test fragment");
+    const fragmentGraph = artifactInventoryResultSchema.parse(
+      fragment.normalized_result,
+    );
+    const { coverage: _coverage, ...legacyFragmentGraph } = fragmentGraph;
+    const mixed = createEvidence(
+      {
+        path: fragment.subject!.local_path,
+        sha256: fragment.subject!.digest.sha256,
+        format: fragment.subject!.format,
+      },
+      PROVIDER,
+      {
+        operation: "inventory_artifact",
+        parameters: fragment.parameters,
+        result: jsonValueSchema.parse({
+          ...legacyFragmentGraph,
+          coverage_status: "partial",
+        }),
+        confidence: "derived",
+        authority: "shipped-artifact",
+      },
+    );
+    expect(() =>
+      parseArtifactInventoryEvidence([firstFragment, mixed]),
+    ).toThrow("Artifact inventory pages do not share one coverage declaration");
+  });
+});
 
 describe("artifact comparison", () => {
   it("classifies deterministic path changes and cites both inventories", async () => {
@@ -132,6 +344,61 @@ describe("artifact comparison", () => {
 });
 
 describe("artifact comparison completeness", () => {
+  it("does not infer child changes from root-only coverage", async () => {
+    const root = await createTestTempDirectory("rea-artifact-root-coverage-");
+    const leftPath = join(root, "left.app");
+    const rightPath = join(root, "right.app");
+    await Promise.all([mkdir(leftPath), mkdir(rightPath)]);
+    await Promise.all([
+      writeFile(join(leftPath, "left-only.txt"), "left"),
+      writeFile(join(rightPath, "right-only.txt"), "right"),
+    ]);
+    const [left, right] = await Promise.all([
+      observe(leftPath),
+      observe(rightPath),
+    ]);
+    const rootOnly = (evidence: Awaited<ReturnType<typeof observe>>) => {
+      const inventory = artifactInventoryResultSchema.parse(
+        evidence.normalized_result,
+      );
+      return createEvidence(
+        {
+          path: evidence.subject?.local_path ?? "",
+          sha256: inventory.manifest.root_sha256,
+          format: inventory.manifest.root_format,
+        },
+        PROVIDER,
+        {
+          operation: "inventory_artifact",
+          parameters: {},
+          result: jsonValueSchema.parse({
+            ...inventory,
+            coverage: { scope: "root", status: "complete" },
+          }),
+          confidence: "derived",
+          authority: "shipped-artifact",
+        },
+      );
+    };
+    const compared = compareArtifacts(rootOnly(left), rootOnly(right));
+    expect(compared.status).toBe("unknown");
+    expect(compared.summary).toMatchObject({ added: 0, removed: 0 });
+    expect(
+      compared.changes
+        .filter(({ logical_path }) => logical_path !== ".")
+        .map(({ logical_path, classification }) => ({
+          logical_path,
+          classification,
+        })),
+    ).toEqual([
+      { logical_path: "left-only.txt", classification: "unknown" },
+      { logical_path: "right-only.txt", classification: "unknown" },
+    ]);
+    expect(compared.limitations).toContain(
+      "Container entry coverage is unavailable for child paths.",
+    );
+  });
+
   it("compares every graph member for inventories larger than 500 entries", async () => {
     const root = await createTestTempDirectory("rea-artifact-pages-");
     const entryCount = 501;
@@ -176,7 +443,182 @@ describe("artifact comparison completeness", () => {
       changes: [],
     });
   }, 15_000);
+});
 
+describe("artifact source-map relationship coverage", () => {
+  it("preserves unknown source-map relationships for duplicate ZIP paths", async () => {
+    const root = await createTestTempDirectory("rea-duplicate-source-map-");
+    const path = join(root, "duplicate-source-map.zip");
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("main.js", new TextReader("first();"), { level: 0 });
+    await writer.add("your.js", new TextReader("second();"), { level: 0 });
+    await writer.add("main.js.map", new TextReader("{}"), { level: 0 });
+    const bytes = Buffer.from(await writer.close());
+    for (const [signature, headerSize] of [
+      [Buffer.from([0x50, 0x4b, 0x03, 0x04]), 30],
+      [Buffer.from([0x50, 0x4b, 0x01, 0x02]), 46],
+    ] as const) {
+      const first = bytes.indexOf(signature);
+      const second = bytes.indexOf(signature, first + 4);
+      if (first < 0 || second <= first)
+        throw new Error("Expected both source ZIP member headers");
+      expect(
+        bytes.subarray(second + headerSize, second + headerSize + 7).toString(),
+      ).toBe("your.js");
+      bytes.write("main.js", second + headerSize);
+    }
+    await writeFile(path, bytes);
+
+    const evidence = await observe(path);
+    const parsed = parseArtifactInventoryEvidence(evidence);
+    const { inventory } = parsed;
+    const map = inventory.occurrences.find(
+      ({ logical_path }) => logical_path === "main.js.map",
+    );
+    if (map === undefined) throw new Error("Expected source-map occurrence");
+    const mapEdge = inventory.edges.find(
+      ({ occurrence_id }) => occurrence_id === map.occurrence_id,
+    );
+
+    expect(inventory.coverage?.status).toBe("unknown");
+    expect(map.limitations).toContain(
+      'Source-map target is unknown because multiple occurrences share "main.js".',
+    );
+    expect(mapEdge).toMatchObject({ relation: "contains" });
+    expect(mapEdge?.relation).not.toBe("maps-source");
+    expect(inventory.integrityContradictions).toEqual([]);
+    expect(
+      inventory.limitations.some((limitation) =>
+        limitation.toLowerCase().includes("integrity"),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("duplicate archive occurrence ownership", () => {
+  it("keeps directory ancestry unknown when ZIP directory paths repeat", async () => {
+    const root = await createTestTempDirectory(
+      "rea-artifact-duplicate-directory-",
+    );
+    const path = join(root, "duplicate-directories.zip");
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("x/", new TextReader(""));
+    await writer.add("y/", new TextReader(""));
+    await writer.add("x/file.txt", new TextReader("member"));
+    const bytes = Buffer.from(await writer.close());
+    for (const [signature, headerSize] of [
+      [Buffer.from([0x50, 0x4b, 0x03, 0x04]), 30],
+      [Buffer.from([0x50, 0x4b, 0x01, 0x02]), 46],
+    ] as const) {
+      const first = bytes.indexOf(signature);
+      const second = bytes.indexOf(signature, first + 4);
+      if (first < 0 || second <= first)
+        throw new Error("Expected both ZIP directory headers");
+      expect(
+        bytes.subarray(second + headerSize, second + headerSize + 2).toString(),
+      ).toBe("y/");
+      bytes.write("x/", second + headerSize);
+    }
+    await writeFile(path, bytes);
+
+    const evidence = await observe(path);
+    const inventory = parseArtifactInventoryEvidence(evidence).inventory;
+    const directory = inventory.occurrences.filter(
+      ({ logical_path }) => logical_path === "x",
+    );
+    const child = inventory.occurrences.find(
+      ({ logical_path }) => logical_path === "x/file.txt",
+    );
+    expect(directory).toHaveLength(2);
+    expect(directory.every(({ artifact_id }) => artifact_id === null)).toBe(
+      true,
+    );
+    expect(child?.parent_occurrence_id).toBeNull();
+    expect(child?.limitations).toContain(
+      'The parent occurrence for "x/file.txt" is unknown because multiple observed directory or container occurrences share "x".',
+    );
+    expect(inventory.coverage.status).toBe("unknown");
+  });
+
+  it("retains duplicate path occurrences across pages and leaves pairing unknown", async () => {
+    const root = await createTestTempDirectory("rea-artifact-duplicate-pages-");
+    const archives = [join(root, "left.zip"), join(root, "right.zip")] as const;
+    for (const [index, path] of archives.entries()) {
+      const writer = new ZipWriter(new Uint8ArrayWriter());
+      await writer.add("x.txt", new TextReader("first"));
+      await writer.add(
+        "y.txt",
+        new TextReader(index === 0 ? "second-left" : "second-right"),
+      );
+      await writer.add("neighbor.txt", new TextReader("neighbor"));
+      const bytes = Buffer.from(await writer.close());
+      // Produce a duplicate path the same way as real malformed/ambiguous ZIP
+      // inputs: retain each member record and rewrite only the equal-length name.
+      for (const [signature, headerSize] of [
+        [Buffer.from([0x50, 0x4b, 0x03, 0x04]), 30],
+        [Buffer.from([0x50, 0x4b, 0x01, 0x02]), 46],
+      ] as const) {
+        const first = bytes.indexOf(signature);
+        const second = bytes.indexOf(signature, first + 4);
+        if (first < 0 || second <= first)
+          throw new Error("Expected both ZIP member headers");
+        expect(
+          bytes
+            .subarray(second + headerSize, second + headerSize + 5)
+            .toString(),
+        ).toBe("y.txt");
+        bytes.write("x.txt", second + headerSize);
+      }
+      await writeFile(path, bytes);
+    }
+
+    const [left, right] = await Promise.all([
+      observe(archives[0]),
+      observe(archives[1]),
+    ]);
+    const parsed = parseArtifactInventoryEvidence(left);
+    const repeated = parsed.inventory.occurrences.filter(
+      ({ logical_path }) => logical_path === "x.txt",
+    );
+    expect(repeated).toHaveLength(2);
+    expect(
+      new Set(repeated.map(({ occurrence_id }) => occurrence_id)).size,
+    ).toBe(2);
+
+    const leftPages = fragmentInventoryEvidence(left, 2);
+    const parsedPages = parseArtifactInventoryEvidence(leftPages);
+    expect(
+      parsedPages.inventory.occurrences.filter(
+        ({ logical_path }) => logical_path === "x.txt",
+      ),
+    ).toHaveLength(2);
+
+    const comparison = compareArtifacts(
+      leftPages,
+      fragmentInventoryEvidence(right, 2),
+    );
+    expect(comparison).toMatchObject({
+      status: "unknown",
+      summary: { unknown: expect.any(Number) },
+      changes: expect.arrayContaining([
+        expect.objectContaining({
+          logical_path: "x.txt",
+          classification: "unknown",
+          dimensions: ["availability"],
+          left_occurrence_id: null,
+          right_occurrence_id: null,
+          left_artifact_id: null,
+          right_artifact_id: null,
+        }),
+      ]),
+    });
+    expect(comparison.limitations).toContain(
+      "Duplicate logical paths cannot be paired across inventories; comparisons for those paths are unknown.",
+    );
+  });
+});
+
+describe("artifact comparison fragment integrity", () => {
   it("assembles real inventory fragments and retains every citation", async () => {
     const parent = await createTestTempDirectory("rea-artifact-fragments-");
     const leftPath = join(parent, "left.app");
@@ -233,6 +675,30 @@ describe("artifact comparison completeness", () => {
         evidence_links: citations,
       })),
     });
+    const fragment = leftFragments[0];
+    if (fragment === undefined) throw new Error("Expected inventory fragments");
+    const conflictingScope = createEvidence(
+      {
+        path: leftPath,
+        sha256: left.subject?.digest.sha256 ?? "",
+        format: "directory",
+      },
+      PROVIDER,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: jsonValueSchema.parse({
+          ...artifactInventoryResultSchema.parse(fragment.normalized_result),
+          coverage: { scope: "root", status: "complete" },
+        }),
+      },
+    );
+    expect(() =>
+      compareArtifacts(
+        [conflictingScope, ...leftFragments.slice(1)],
+        rightFragments,
+      ),
+    ).toThrow(/coverage declaration/u);
   }, 15_000);
 
   it("rejects non-inventory and tampered Evidence", async () => {
@@ -261,5 +727,92 @@ describe("artifact comparison completeness", () => {
     expect(() => compareArtifacts(mismatchedSubject, evidence)).toThrow(
       /root digest/u,
     );
+  });
+});
+
+describe("ZIP non-entry coverage", () => {
+  it("retains pre-directory APK block changes and compares historical scope descriptions", async () => {
+    const root = await createTestTempDirectory("rea-apk-block-compare-");
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("classes.dex", new TextReader("unchanged entry"));
+    const zip = Buffer.from(await writer.close());
+    const eocd = zip.length - 22;
+    expect(zip.readUInt32LE(eocd)).toBe(0x06054b50);
+    const directory = zip.readUInt32LE(eocd + 16);
+    // APK Signing Block framing with one opaque padding pair, not a verified signature.
+    // https://source.android.com/docs/security/features/apksigning/v2#apk-signing-block
+    const block = Buffer.alloc(48);
+    block.writeBigUInt64LE(40n, 0);
+    block.writeBigUInt64LE(8n, 8);
+    block.writeUInt32LE(0x42726577, 16);
+    block.writeBigUInt64LE(40n, 24);
+    block.write("APK Sig Block 42", 32, "ascii");
+    const paths = [join(root, "before.apk"), join(root, "after.apk")];
+    for (const [index, path] of paths.entries()) {
+      block.writeUInt32LE(index, 20);
+      const apk = Buffer.concat([
+        zip.subarray(0, directory),
+        block,
+        zip.subarray(directory),
+      ]);
+      apk.writeUInt32LE(directory + block.length, eocd + block.length + 16);
+      await writeFile(path, apk);
+    }
+    const left = await observe(paths[0]!);
+    const right = await observe(paths[1]!);
+    const inventory = artifactInventoryResultSchema.parse(
+      left.normalized_result,
+    );
+    expect(inventory.limitations).toContain(
+      "ZIP inventory lists central-directory entries only. Non-entry bytes, including an APK Signing Block before the central directory or a ZIP comment after it, are not occurrences.",
+    );
+    expect(
+      inventory.occurrences.map(({ logical_path }) => logical_path).sort(),
+    ).toEqual([".", "classes.dex"]);
+    expect(compareArtifacts(left, right)).toMatchObject({
+      status: "changed",
+      summary: { changed: 1, unchanged: 1, unknown: 0 },
+      changes: [
+        expect.objectContaining({ logical_path: ".", dimensions: ["content"] }),
+      ],
+    });
+    const {
+      coverage: _coverage,
+      coverage_status: _coverageStatus,
+      ...legacyInventory
+    } = inventory;
+    const withLimitation = (limitation: string) =>
+      createEvidence(
+        {
+          path: paths[0]!,
+          sha256: inventory.manifest.root_sha256,
+          format: "apk",
+        },
+        PROVIDER,
+        {
+          operation: "inventory_artifact",
+          parameters: {},
+          result: jsonValueSchema.parse({
+            ...legacyInventory,
+            limitations: [limitation],
+          }),
+          confidence: "observed",
+          authority: "shipped-artifact",
+        },
+      );
+    const historical = withLimitation(
+      "ZIP inventory lists central-directory entries only. Bytes after the central directory, including an APK Signing Block or a ZIP comment, are not occurrences.",
+    );
+    expect(compareArtifacts(historical, left)).toMatchObject({
+      status: "unchanged",
+      summary: { unchanged: 2, unknown: 0 },
+      changes: [],
+    });
+    expect(
+      compareArtifacts(
+        withLimitation("ZIP entry bytes could not be read."),
+        left,
+      ).status,
+    ).toBe("unknown");
   });
 });

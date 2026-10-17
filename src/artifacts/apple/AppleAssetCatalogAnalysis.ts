@@ -8,6 +8,7 @@ import {
 import { analyzeInterfaceBuilderBundle } from "./InterfaceBuilderAnalysis.js";
 import {
   appleAssetCatalogInputSchema,
+  appleResourceKeyFields,
   parseAppleAssetCatalogRecords,
   projectAppleAssetCatalogPage,
 } from "../../domain/apple/appleAssetCatalog.js";
@@ -16,17 +17,6 @@ import { execFileOutput } from "../../process/ExecFileOutput.js";
 const ASSETUTIL = "/usr/bin/assetutil";
 const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
 const MAX_TOTAL_METADATA_BYTES = 64 * 1024 * 1024;
-const RESOURCE_KEY_FIELDS = new Set([
-  "image",
-  "imageName",
-  "image_name",
-  "resourceName",
-  "resource_name",
-  "assetName",
-  "asset_name",
-  "UIImageName",
-  "NSImageName",
-]);
 
 /** Inspect compiled asset catalog metadata without extracting rendition bytes. */
 export const analyzeAppleAssetCatalogs = async (input: {
@@ -39,6 +29,7 @@ export const analyzeAppleAssetCatalogs = async (input: {
     path: string,
     signal?: AbortSignal,
   ) => Promise<string>;
+  readonly analyzeInterfaceBuilder?: typeof analyzeInterfaceBuilderBundle;
 }) => {
   if (process.platform !== "darwin" && input.runAssetUtil === undefined)
     throw new ArtifactReaderFailure(
@@ -46,6 +37,81 @@ export const analyzeAppleAssetCatalogs = async (input: {
       "Apple asset catalog inspection requires macOS assetutil",
     );
   const page = appleAssetCatalogInputSchema.parse(input.page ?? {});
+  // The Interface Builder graph only supplies resource keys for the join. Its
+  // bundle walk is independent of the catalog walk, so both run together; a
+  // catalog failure cancels it and is reported as the sequential order would.
+  const interfaceBuilderCancel = new AbortController();
+  const interfaceBuilderAnalysis = (
+    input.analyzeInterfaceBuilder ?? analyzeInterfaceBuilderBundle
+  )({
+    bundlePath: input.bundlePath,
+    targetSha256: input.targetSha256,
+    signal:
+      input.signal === undefined
+        ? interfaceBuilderCancel.signal
+        : AbortSignal.any([input.signal, interfaceBuilderCancel.signal]),
+  }).then(
+    (value) => ({ ok: true, value }) as const,
+    (error: unknown) => ({ ok: false, error }) as const,
+  );
+  let catalogs: Awaited<ReturnType<typeof collectAssetCatalogs>>["catalogs"];
+  let uninspected: readonly string[];
+  try {
+    ({ catalogs, uninspected } = await collectAssetCatalogs(input));
+  } catch (cause: unknown) {
+    interfaceBuilderCancel.abort();
+    await interfaceBuilderAnalysis;
+    throw cause;
+  }
+  const analyzed = await interfaceBuilderAnalysis;
+  if (!analyzed.ok) throw analyzed.error;
+  const interfaceBuilder = analyzed.value;
+  const resourceReferences = collectInterfaceBuilderResourceKeys(
+    interfaceBuilder.graph.nodes,
+  );
+  const result = projectAppleAssetCatalogPage({
+    targetSha256: input.targetSha256,
+    catalogs,
+    offset: page.offset,
+    limit: page.limit,
+    resourceReferences,
+  });
+  return {
+    ...result,
+    limitations: [
+      ...result.limitations,
+      // An app without a compiled catalog is an observed empty inventory, not
+      // a missing host tool.
+      ...(catalogs.length === 0
+        ? [
+            "No compiled Assets.car catalog was found among the app bundle's regular files (symlinks are not followed); any resource keys are reported as unmatched.",
+          ]
+        : []),
+      ...(uninspected.length === 0
+        ? []
+        : [
+            `Asset catalog entries that are not regular files were not inspected, so resource keys reported as unmatched may resolve there: ${uninspected.join(", ")}`,
+          ]),
+      "Exact resource-key joins use only recognized image or asset key fields on decoded Interface Builder resource objects; other archive resource references are not inferred.",
+      ...(interfaceBuilder.graph.truncated
+        ? [
+            "Interface Builder resource-key joins may be incomplete because the decoded UI graph was truncated.",
+          ]
+        : []),
+    ],
+  };
+};
+
+/** Inspect every regular Assets.car in the bundle; non-file entries are listed. */
+const collectAssetCatalogs = async (input: {
+  readonly bundlePath: string;
+  readonly environment: Readonly<NodeJS.ProcessEnv>;
+  readonly signal?: AbortSignal;
+  readonly runAssetUtil?: (
+    path: string,
+    signal?: AbortSignal,
+  ) => Promise<string>;
+}) => {
   const reader = new DirectoryArtifactReader(input.bundlePath);
   const catalogs: {
     path: string;
@@ -87,45 +153,7 @@ export const analyzeAppleAssetCatalogs = async (input: {
       "path",
       `Asset catalog entries are not regular files and were not inspected: ${uninspected.join(", ")}`,
     );
-  const interfaceBuilder = await analyzeInterfaceBuilderBundle({
-    bundlePath: input.bundlePath,
-    targetSha256: input.targetSha256,
-    ...(input.signal === undefined ? {} : { signal: input.signal }),
-  });
-  const resourceReferences = collectInterfaceBuilderResourceKeys(
-    interfaceBuilder.graph.nodes,
-  );
-  const result = projectAppleAssetCatalogPage({
-    targetSha256: input.targetSha256,
-    catalogs,
-    offset: page.offset,
-    limit: page.limit,
-    resourceReferences,
-  });
-  return {
-    ...result,
-    limitations: [
-      ...result.limitations,
-      // An app without a compiled catalog is an observed empty inventory, not
-      // a missing host tool.
-      ...(catalogs.length === 0
-        ? [
-            "No compiled Assets.car catalog was found among the app bundle's regular files (symlinks are not followed); any resource keys are reported as unmatched.",
-          ]
-        : []),
-      ...(uninspected.length === 0
-        ? []
-        : [
-            `Asset catalog entries that are not regular files were not inspected, so resource keys reported as unmatched may resolve there: ${uninspected.join(", ")}`,
-          ]),
-      "Exact resource-key joins use only recognized image or asset key fields on decoded Interface Builder resource objects; other archive resource references are not inferred.",
-      ...(interfaceBuilder.graph.truncated
-        ? [
-            "Interface Builder resource-key joins may be incomplete because the decoded UI graph was truncated.",
-          ]
-        : []),
-    ],
-  };
+  return { catalogs, uninspected };
 };
 
 const inspectAssetCatalogEntry = async (input: {
@@ -201,27 +229,22 @@ export const collectInterfaceBuilderResourceKeys = (
   }[],
 ) =>
   nodes.flatMap((node) => {
+    if (node.kind !== "resource") return [];
     const source = node.evidence.find(
       (item) => item.artifact_path !== null && item.artifact_sha256 !== null,
     );
     const sourcePath = source?.artifact_path;
     const sourceArchiveSha256 = source?.artifact_sha256;
     if (sourcePath == null || sourceArchiveSha256 == null) return [];
-    return Object.entries(node.attributes).flatMap(([field, value]) =>
-      RESOURCE_KEY_FIELDS.has(field) &&
-      typeof value === "string" &&
-      value.length > 0
-        ? [
-            {
-              sourceNodeId: node.id,
-              sourcePath,
-              sourceArchiveSha256,
-              field,
-              key: value,
-            },
-          ]
-        : [],
-    );
+    return appleResourceKeyFields(node.attributes).flatMap(([field, value]) => [
+      {
+        sourceNodeId: node.id,
+        sourcePath,
+        sourceArchiveSha256,
+        field,
+        key: value,
+      },
+    ]);
   });
 
 const runAssetUtil = async (

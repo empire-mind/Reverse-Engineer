@@ -1,6 +1,9 @@
 import * as t from "@babel/types";
 import {
   semanticStaticPropertyKey,
+  semanticWriteSiteTarget,
+  semanticWriteTargets,
+  runtimeFunctionParameters,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { javascriptBootstrapAt } from "./javascriptBootstrap.js";
@@ -15,7 +18,6 @@ import {
   modulePropertyName,
 } from "./javascriptStaticAnalysisHelpers.js";
 import {
-  childNodes,
   completeSemanticSteps,
   traverseJavaScriptAst,
 } from "./javascriptSemanticTraversal.js";
@@ -47,6 +49,25 @@ interface SymbolicReturnFlow {
   readonly fallsThrough: boolean;
 }
 const emptyEnvironment: SymbolicEnvironment = { values: new Map() };
+const isObjectPrototypeSetter = (
+  property: t.ObjectMethod | t.ObjectProperty,
+  name: string,
+): boolean =>
+  t.isObjectProperty(property) &&
+  !property.computed &&
+  !property.shorthand &&
+  name === "__proto__";
+
+const containsOwnedReturn = (root: t.Node): boolean => {
+  let found = false;
+  traverseJavaScriptAst(root, {
+    skip: (node) => found || t.isFunction(node) || t.isClass(node),
+    enter: (node) => {
+      if (t.isReturnStatement(node)) found = true;
+    },
+  });
+  return found;
+};
 
 /** Demand-driven substitutions for local bindings, closures and literal module tables. */
 export class JavaScriptSymbolicBindings {
@@ -96,12 +117,8 @@ export class JavaScriptSymbolicBindings {
     });
     traverseJavaScriptAst(program, {
       enter: (node) => {
-        if (t.isAssignmentExpression(node))
-          this.#indexWrite(node.left, node.right, node);
-        if (t.isUpdateExpression(node))
-          this.#indexWrite(node.argument, node, node);
-        if (t.isUnaryExpression(node, { operator: "delete" }))
-          this.#indexWrite(node.argument, node, node);
+        const target = semanticWriteSiteTarget(node);
+        if (target !== null) this.#indexWriteSite(target, node);
         if (
           t.isCallExpression(node) &&
           t.isMemberExpression(node.callee) &&
@@ -243,15 +260,30 @@ export class JavaScriptSymbolicBindings {
             index = null;
             break;
           }
+          if (isObjectPrototypeSetter(property, name)) continue;
           properties.set(name, property);
         }
         this.#literalPropertyIndex.set(value.node, index);
       }
       if (index !== null) {
         const property = index.get(key);
-        return property === undefined
-          ? symbolicUnknown("missing property")
-          : this.#objectPropertyValue(property, value.environment);
+        if (property !== undefined)
+          return this.#objectPropertyValue(property, value.environment);
+        if (key === "__proto__") {
+          const prototypeSetter = [...value.node.properties]
+            .reverse()
+            .filter(
+              (candidate): candidate is t.ObjectMethod | t.ObjectProperty =>
+                !t.isSpreadElement(candidate),
+            )
+            .find((candidate) => isObjectPrototypeSetter(candidate, key));
+          if (prototypeSetter !== undefined)
+            return this.#objectPropertyValue(
+              prototypeSetter,
+              value.environment,
+            );
+        }
+        return symbolicUnknown("missing property");
       }
       for (const p of [...value.node.properties].reverse()) {
         if (t.isSpreadElement(p)) {
@@ -314,7 +346,8 @@ export class JavaScriptSymbolicBindings {
           t.isSpreadElement(p)
             ? this.members(this.evaluate(p.argument, value.environment), active)
             : [semanticStaticPropertyKey(p.key, p.computed)].filter(
-                (k): k is string => k !== null,
+                (k): k is string =>
+                  k !== null && !isObjectPrototypeSetter(p, k),
               ),
         ),
       ),
@@ -363,7 +396,7 @@ export class JavaScriptSymbolicBindings {
     invocationNode?: t.Node,
   ): SymbolicEnvironment {
     const values = new Map<string, SymbolicValue>();
-    fn.node.params.forEach((param, index) => {
+    runtimeFunctionParameters(fn.node).forEach((param, index) => {
       const target = t.isRestElement(param) ? param.argument : param;
       if (!t.isIdentifier(target)) return;
       const binding = resolveSemanticBindingState(
@@ -524,7 +557,7 @@ export class JavaScriptSymbolicBindings {
       this.unresolved = true;
       return symbolicUnknown("initializer not available at this read");
     }
-    if (this.state.conditionalInitializers.has(initializer.node))
+    if (this.state.conditionallySkippedExpressions.has(initializer.node))
       return symbolicUnknown("conditional initializer");
     let value = this.evaluate(initializer.node, env);
     for (const key of initializer.projection) {
@@ -611,20 +644,19 @@ export class JavaScriptSymbolicBindings {
 
   #moduleCompletionPoint(factory: t.Function): t.Node {
     let earliestReturn: t.ReturnStatement | undefined;
-    const pending: t.Node[] = [factory.body];
-    while (pending.length > 0) {
-      const node = pending.pop();
-      if (!node) continue;
-      if (node !== factory.body && (t.isFunction(node) || t.isClass(node)))
-        continue;
-      if (
-        t.isReturnStatement(node) &&
-        (earliestReturn === undefined ||
-          (node.start ?? Infinity) < (earliestReturn.start ?? Infinity))
-      )
-        earliestReturn = node;
-      pending.push(...childNodes(node));
-    }
+    // Use the shared traversal so source-sized child lists are pushed one at
+    // a time. Spreading array elements or call arguments overflows the stack.
+    traverseJavaScriptAst(factory.body, {
+      skip: (node) => t.isFunction(node) || t.isClass(node),
+      enter: (node) => {
+        if (
+          t.isReturnStatement(node) &&
+          (earliestReturn === undefined ||
+            (node.start ?? Infinity) < (earliestReturn.start ?? Infinity))
+        )
+          earliestReturn = node;
+      },
+    });
     return earliestReturn ?? factory.body;
   }
 
@@ -811,6 +843,24 @@ export class JavaScriptSymbolicBindings {
             unresolvedFallthrough = true;
         }
       }
+      if (
+        t.isWhileStatement(statement) ||
+        t.isDoWhileStatement(statement) ||
+        t.isForStatement(statement) ||
+        t.isForInStatement(statement) ||
+        t.isForOfStatement(statement) ||
+        t.isSwitchStatement(statement) ||
+        t.isTryStatement(statement)
+      ) {
+        if (containsOwnedReturn(statement)) {
+          possible.push(
+            symbolicUnknown(
+              `unsupported return control flow: ${statement.type}`,
+            ),
+          );
+          unresolvedFallthrough = true;
+        }
+      }
     }
     return { values: possible, fallsThrough: true };
   }
@@ -842,9 +892,7 @@ export class JavaScriptSymbolicBindings {
           ? {}
           : { scopeId: this.state.scopeByNode.get(factory)!.scopeId }),
       };
-      const first = factory.params[0];
-      const second = factory.params[1];
-      const third = factory.params[2];
+      const [first, second, third] = runtimeFunctionParameters(factory);
       const binding = (n: t.Node | undefined) =>
         t.isIdentifier(n)
           ? resolveSemanticBindingState(this.state, n, n.name)?.bindingId
@@ -920,15 +968,33 @@ export class JavaScriptSymbolicBindings {
     else for (const key of invalidSlots) modules.delete(key);
   }
 
-  #indexWrite(target: t.Node, value: t.Node, site: t.Node): void {
+  #indexWriteSite(target: t.Node, site: t.Node): void {
+    const direct = unwrapJavaScriptExpression(target).node;
+    if (
+      (t.isIdentifier(direct) || t.isMemberExpression(direct)) &&
+      !t.isForOfStatement(site) &&
+      !t.isForInStatement(site)
+    ) {
+      this.#indexWrite(
+        direct,
+        t.isAssignmentExpression(site) ? site.right : site,
+        site,
+      );
+      return;
+    }
+    for (const leaf of semanticWriteTargets(target))
+      this.#indexWrite(leaf, site, site, false);
+  }
+
+  #indexWrite(target: t.Node, value: t.Node, site: t.Node, exact = true): void {
     const path: string[] = [];
-    let root = target;
-    let dynamic = false;
+    let root = unwrapJavaScriptExpression(target).node;
+    let dynamic = !exact;
     while (t.isMemberExpression(root)) {
       const key = semanticStaticPropertyKey(root.property, root.computed);
       if (key === null) dynamic = true;
       else path.unshift(key);
-      root = root.object;
+      root = unwrapJavaScriptExpression(root.object).node;
     }
     if (dynamic && t.isIdentifier(root)) {
       const binding = resolveSemanticBindingState(this.state, root, root.name);

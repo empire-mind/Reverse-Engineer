@@ -30,6 +30,7 @@ export interface PwntoolsFailureContext {
   readonly operation: string;
   readonly providerId: string;
   readonly precedingOutput?: AnalysisCapturedOutput;
+  readonly configurationKey?: string;
 }
 const DEFAULT_CONTEXT = {
   operation: "inspect_binary_layout",
@@ -264,6 +265,7 @@ export const pwntoolsUnavailable = (
 ): ProviderSelectionError =>
   new ProviderSelectionError({
     ...(capturedOutput === undefined ? {} : { capturedOutput }),
+    userMessage: reason,
     operation: context.operation,
     reason: "provider_unavailable",
     requestedProviderId: context.providerId,
@@ -274,7 +276,7 @@ export const pwntoolsUnavailable = (
         code: "provider_unavailable",
         reason,
         diagnostics: {
-          configuration_key: "REA_PWNTOOLS_PYTHON",
+          configuration_key: context.configurationKey ?? "REA_PWNTOOLS_PYTHON",
           executable_path: path,
           ...(systemCode === undefined ? {} : { system_code: systemCode }),
         },

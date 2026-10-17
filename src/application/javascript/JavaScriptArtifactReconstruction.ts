@@ -252,9 +252,17 @@ export const reconstructJavaScriptArtifact = async (
           : { source_selection: files.source_selection }),
         graph,
         semantic_graph: semanticGraph,
-        electron_summary: summarizeElectronBoundaries(analysis),
+        electron_summary: summarizeElectronBoundaries(
+          analysis,
+          new Set(
+            snapshot.occurrences
+              .filter(({ entry_kind }) => entry_kind === "directory")
+              .map(({ logical_path }) => logical_path),
+          ),
+        ),
         statistics: {
-          relevant_files: files.files.length,
+          relevant_files:
+            files.files.length + files.unavailable_relevant_files.length,
           nested_asar_containers: files.containers.length,
           text_bytes_read: files.text_bytes_read,
           invalid_utf8_files: files.invalid_utf8_files,
@@ -277,15 +285,9 @@ export const reconstructJavaScriptArtifact = async (
             limitations: completed.graph.limitations,
           }),
         );
-        const { max_heap_mb, analysis_timeout_ms, ...coreInput } = input;
-        const parameters = {
-          ...coreInput,
-          ...(max_heap_mb === undefined ? {} : { max_heap_mb }),
-          ...(analysis_timeout_ms === undefined ? {} : { analysis_timeout_ms }),
-        };
         const evidence =
           await createOwnedJavaScriptApplicationEvidenceCooperatively(
-            parameters,
+            input,
             partial,
           );
         throw interruption.retainPartialObservation(evidence);

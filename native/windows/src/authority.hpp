@@ -33,6 +33,8 @@ struct Failure : std::runtime_error {
   DWORD win32;
   std::wstring path;
   std::string constraint;
+  // Affirmative proof for a failed runtime-parent admission; omission is unknown.
+  bool runtimeDirectoryUnallocated = false;
   Failure(std::string constraint, std::wstring path = L"", DWORD code = GetLastError())
       : std::runtime_error(constraint), win32(code), path(std::move(path)),
         constraint(std::move(constraint)) {}
@@ -121,7 +123,8 @@ napi_value wrap(napi_env env, std::unique_ptr<Resource> resource);
 Resource& resource(napi_env env, napi_value value, Kind kind);
 
 std::unique_ptr<File> openFile(const std::wstring& path, DWORD access = GENERIC_READ,
-                             bool directory = false);
+                             bool directory = false,
+                             DWORD finalSharing = FILE_SHARE_READ);
 napi_value identity(napi_env env, HANDLE handle, const std::wstring& path);
 std::unique_ptr<Runtime> createRuntime(const std::wstring& parent, const std::wstring& prefix);
 void closeRuntime(Runtime& runtime);

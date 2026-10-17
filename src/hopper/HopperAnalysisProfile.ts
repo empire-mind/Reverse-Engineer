@@ -8,8 +8,10 @@ import type {
 import { createAnalysisProfile } from "../domain/analysisProfile.js";
 import {
   isMachOFormat,
+  isElfMetadataArchitecture,
   type BinaryTarget,
-  type BinaryArchitecture,
+  type ElfMetadataArchitecture,
+  type HeaderArchitecture,
 } from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
@@ -52,7 +54,7 @@ export const resolveHopperAnalysisProfile = async (
   let preparedImage: HopperMachOImage | undefined;
   if (
     target.kind === "executable" &&
-    machoContainer === "fat64" &&
+    (machoContainer === "fat64" || machoContainer === "fat32") &&
     options.loaderArgsOverride.length === 0
   ) {
     const resolved = await resolveHopperMachOImage(target, options.signal);
@@ -80,6 +82,7 @@ export const resolveHopperAnalysisProfile = async (
     profile: createAnalysisProfile(provider, {
       target_kind: target.kind,
       target_format: target.format,
+      function_dossier_coverage: "observed-facets-and-call-relationships-v1",
       architecture: target.architecture ?? null,
       available_architectures: [
         ...(target.availableArchitectures ?? []),
@@ -101,6 +104,16 @@ export const resolveHopperAnalysisProfile = async (
   });
 };
 
+/** Ghidra owns these lanes; Hopper names the family it declines rather than guessing. */
+const HOPPER_DECLINED_ARCHITECTURE_LABELS: Record<
+  ElfMetadataArchitecture,
+  string
+> = {
+  mips: "MIPS",
+  riscv: "RISC-V",
+  powerpc: "PowerPC",
+};
+
 /** Derive Hopper's complete non-interactive CLI loader selection. */
 export const hopperLoaderArgsForTarget = (
   target: BinaryTarget,
@@ -112,13 +125,15 @@ export const hopperLoaderArgsForTarget = (
   if (target.kind === "database") return ok([]);
   if (target.kind !== "executable")
     return err(new ProviderAdapterError("hopper", "resolve_analysis_profile"));
+  if (target.format === "raw-binary")
+    return err(new ProviderAdapterError("hopper", "resolve_analysis_profile"));
   const architecture = target.architecture;
-  if (architecture === "mips")
+  if (isElfMetadataArchitecture(architecture))
     return err(
       new AnalysisCapabilityUnavailableError(
         "hopper",
         "resolve_analysis_profile",
-        "REA's Hopper adapter does not admit MIPS targets. Select a verified Ghidra MIPS profile instead.",
+        `REA's Hopper adapter does not admit ${HOPPER_DECLINED_ARCHITECTURE_LABELS[architecture]} targets. Select a verified Ghidra ${HOPPER_DECLINED_ARCHITECTURE_LABELS[architecture]} profile instead.`,
       ),
     );
   const flag = hopperArchitectureFlag(architecture);
@@ -144,16 +159,13 @@ export const hopperLoaderArgsForTarget = (
       return ok(["-l", "WinPE", flag]);
     case "dos-mz":
     case "dos-com":
-    case "raw-binary":
       return err(
         new ProviderAdapterError("hopper", "resolve_analysis_profile"),
       );
   }
 };
 
-const hopperArchitectureFlag = (
-  architecture: Exclude<BinaryArchitecture, "mips">,
-): string => {
+const hopperArchitectureFlag = (architecture: HeaderArchitecture): string => {
   switch (architecture) {
     case "x86":
       return "--intel-32";

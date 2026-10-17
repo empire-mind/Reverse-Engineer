@@ -1,4 +1,7 @@
+import { wasmInterfaceSchema } from "./wasmInterface.js";
 import { z } from "zod";
+import { createHash } from "node:crypto";
+import type { EvidenceSubjectTarget } from "../evidence.js";
 
 import { localPathStringSchema } from "../localPath.js";
 
@@ -30,6 +33,7 @@ export const wasmArtifactSchema = z
         description: z.string(),
       }),
     ),
+    interface: wasmInterfaceSchema.exactOptional(),
     imports: z.array(z.string()),
     exports: z.array(z.string()),
     headers: z.string(),
@@ -83,6 +87,15 @@ export const wasmArtifactSchema = z
     limitations: z.array(z.string()),
   })
   .superRefine((value, context) => {
+    if (
+      createHash("sha256").update(value.wat.text, "utf8").digest("hex") !==
+      value.wat.sha256
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["wat", "sha256"],
+        message: "Decoded WAT digest does not match its UTF-8 text.",
+      });
     const selected = value.candidates[0];
     if (
       selected?.path !== value.artifact.path ||
@@ -125,3 +138,22 @@ export const wasmArtifactSchema = z
 export type InspectWasmArtifactInput = z.infer<
   typeof inspectWasmArtifactInputSchema
 >;
+export type WasmArtifact = z.infer<typeof wasmArtifactSchema>;
+
+/** A WASM observation must identify the selected file path and byte digest. */
+export type WasmArtifactSubject = Pick<
+  EvidenceSubjectTarget,
+  "path" | "sha256" | "format"
+>;
+type WasmArtifactFileSubject = WasmArtifactSubject & {
+  readonly format: "file";
+};
+
+export const wasmArtifactMatchesSubject = (
+  artifact: WasmArtifact["artifact"],
+  subject: WasmArtifactSubject | null | undefined,
+): subject is WasmArtifactFileSubject =>
+  subject != null &&
+  subject.path === artifact.path &&
+  subject.sha256 === artifact.sha256 &&
+  subject.format === "file";

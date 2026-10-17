@@ -1,6 +1,9 @@
 import * as t from "@babel/types";
 
-import type { JavaScriptSemanticPropertyPath } from "./javascriptSemanticPropertyPaths.js";
+import type {
+  JavaScriptSemanticPropertyPath,
+  SemanticPropertyPathCoverage,
+} from "./javascriptSemanticPropertyPaths.js";
 
 import type {
   JavaScriptModuleOrigin,
@@ -9,6 +12,7 @@ import type {
   JavaScriptSemanticCallable,
   JavaScriptSemanticScope,
 } from "./javascriptSemanticIr.js";
+import type { JavaScriptModuleResolutionMode } from "./javascriptModuleResolutionMode.js";
 
 /** Internal initializer plus a destructuring/member projection. */
 interface JavaScriptSemanticInitializer {
@@ -28,21 +32,31 @@ interface JavaScriptSemanticReferenceInitializer extends JavaScriptSemanticIniti
 }
 
 /** Mutable binding state used only while constructing the immutable IR. */
+export interface JavaScriptSemanticMemberEffect {
+  readonly path: JavaScriptSemanticPropertyPath;
+  readonly node: t.Node | undefined;
+}
+
+export interface JavaScriptSemanticRequiredModuleEffect extends JavaScriptSemanticMemberEffect {
+  readonly kind: "write" | "escape";
+}
+
 export interface JavaScriptSemanticBindingState {
   readonly bindingId: string;
   readonly scopeId: string;
   readonly name: string;
   kind: JavaScriptSemanticDefinition["kind"];
+  /** Source declaration form retained internally for CommonJS wrapper bindings. */
+  declarationKinds: Set<"var" | "let" | "const" | "using" | "await using">;
   mutable: boolean;
-  readonly mutatedPaths: JavaScriptSemanticPropertyPath[];
-  readonly escapedPaths: {
-    readonly path: JavaScriptSemanticPropertyPath;
-    readonly node: t.Node | undefined;
-  }[];
+  readonly memberWrites: JavaScriptSemanticMemberEffect[];
+  readonly escapedPaths: JavaScriptSemanticMemberEffect[];
   readonly definitions: JavaScriptSemanticDefinition[];
   readonly initializers: JavaScriptSemanticInitializer[];
   readonly referenceInitializers: JavaScriptSemanticReferenceInitializer[];
   readonly directOrigins: JavaScriptModuleOrigin[];
+  /** An ECMAScript import that exists at runtime, excluding type-only and import-equals syntax. */
+  runtimeImport: boolean;
 }
 
 /** Mutable lexical-scope state used only during AST recovery. */
@@ -57,12 +71,20 @@ export interface JavaScriptSemanticScopeState {
 
 /** Shared state for semantic collection and evaluation. */
 export interface JavaScriptSemanticAnalysisState {
+  readonly program: t.Program;
+  /** Effective loader for static imports in this source artifact. */
+  readonly staticImportResolutionMode: JavaScriptModuleResolutionMode;
   readonly parentsByNode: WeakMap<t.Node, t.Node>;
   readonly scopes: JavaScriptSemanticScopeState[];
   readonly scopesById: Map<string, JavaScriptSemanticScopeState>;
   /** Scope boundaries and descendant scopes resolved on demand. */
   readonly scopeByNode: WeakMap<t.Node, JavaScriptSemanticScopeState>;
   readonly bindingsById: Map<string, JavaScriptSemanticBindingState>;
+  /** Effects on a cached require exports object, independent of local projections. */
+  readonly requiredModuleEffects: Map<
+    string,
+    JavaScriptSemanticRequiredModuleEffect[]
+  >;
   readonly callables: JavaScriptSemanticCallable[];
   readonly callableNodesById: Map<string, t.Node>;
   readonly moduleLinks: JavaScriptSemanticModuleLink[];
@@ -72,7 +94,19 @@ export interface JavaScriptSemanticAnalysisState {
     JavaScriptSemanticModuleLink,
     JavaScriptSemanticBindingState
   >;
-  readonly conditionalInitializers: WeakSet<t.Node>;
+  /** Default expressions capture their value at the export statement. */
+  readonly defaultExportExpressions: WeakMap<
+    JavaScriptSemanticModuleLink,
+    t.Node
+  >;
+  /** Initializer expressions whose write can be skipped by enclosing control flow. */
+  readonly conditionallySkippedExpressions: WeakSet<t.Node>;
+  /** Unbound identifier writes retain their source sites for capture ordering. */
+  readonly ambientBindingWrites: Map<string, t.Node[]>;
+  /** Source-local writes, tagged by global object or import.meta identity. */
+  readonly ambientWrites: SemanticPropertyPathCoverage;
+  /** Source sites distinguish replacement before an ambient identity capture from later writes. */
+  readonly ambientWriteEffects: JavaScriptSemanticMemberEffect[];
 }
 
 /**
@@ -94,7 +128,7 @@ export const semanticStableInitializer = (
         (definition?.kind === "function" || definition?.kind === "class"))) &&
     binding.initializers.length === 1 &&
     initializer !== undefined &&
-    !state.conditionalInitializers.has(initializer.node)
+    !state.conditionallySkippedExpressions.has(initializer.node)
     ? initializer
     : undefined;
 };
@@ -224,5 +258,30 @@ export const isUnshadowedGlobal = (
   name: string,
 ): boolean =>
   t.isIdentifier(node, { name }) &&
-  resolveSemanticBindingState(state, node, name) === undefined &&
-  !semanticResolutionBlocked(state, node, name);
+  (resolveSemanticBindingState(state, node, name) === undefined
+    ? !semanticResolutionBlocked(state, node, name)
+    : isUnmodifiedCommonJsWrapperBinding(node, name, state));
+
+/** A program-level `var` redeclaration still denotes its untouched CJS wrapper parameter. */
+export const isUnmodifiedCommonJsWrapperBinding = (
+  node: t.Node,
+  name: string,
+  state: JavaScriptSemanticAnalysisState,
+): boolean => {
+  // Parser sourceType separates explicit modules from script/CommonJS source;
+  // specifier resolution mode does not establish that distinction.
+  if (
+    state.program.sourceType !== "script" ||
+    !["module", "exports", "require"].includes(name) ||
+    !t.isIdentifier(node, { name })
+  )
+    return false;
+  const binding = resolveSemanticBindingState(state, node, name);
+  if (binding === undefined || binding.initializers.length !== 0) return false;
+  const scope = state.scopesById.get(binding.scopeId);
+  return (
+    scope?.kind === "program" &&
+    binding.declarationKinds.size > 0 &&
+    [...binding.declarationKinds].every((kind) => kind === "var")
+  );
+};

@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
 import { z } from "zod";
 
-import type { ParsedInventorySet } from "./artifactInventoryEvidence.js";
+import {
+  hasCompleteInventoryCoverage,
+  type ParsedInventorySet,
+} from "./artifactInventoryEvidence.js";
 import { evidenceSchema } from "./evidence.js";
 import { digestSchema } from "./digests.js";
 import { prefixedDigestSchema } from "./digests.js";
@@ -29,6 +32,16 @@ export const projectedComponentSchema = z.strictObject({
   format: z.string().min(1),
 });
 
+/** Inventoried paths whose content identity is unavailable, retained as unknown. */
+export const unavailableComponentSchema = z.strictObject({
+  path: projectionPathSchema,
+  artifact_id: z.null(),
+  sha256: z.null(),
+  format: z.string().min(1),
+  encrypted: z.boolean(),
+  limitations: z.array(z.string()),
+});
+
 export type ProjectedComponent = z.infer<typeof projectedComponentSchema>;
 
 /** Path-pair hypotheses connecting managed content to a native library. */
@@ -49,10 +62,12 @@ export const projectionCoverage = (
   budgetComplete: boolean,
 ): {
   status: "complete-within-inventory" | "partial";
+  /** True when all manifest graph-member counts are present, independent of source coverage. */
   inventory_complete: boolean;
 } => ({
   status:
-    inventory.complete && budgetComplete
+    hasCompleteInventoryCoverage(inventory, "container-entries") &&
+    budgetComplete
       ? ("complete-within-inventory" as const)
       : ("partial" as const),
   inventory_complete: inventory.complete,
@@ -85,13 +100,24 @@ export const projectedComponents = (
     });
 };
 
-export { bridgeCandidateCoverageSchema, projectCartesianCandidates };
+export const unavailableComponents = (
+  inventory: ParsedInventorySet["inventory"],
+) =>
+  inventory.occurrences
+    .filter(
+      (occurrence) =>
+        occurrence.logical_path !== "." && occurrence.artifact_id === null,
+    )
+    .map((occurrence) => ({
+      path: occurrence.logical_path,
+      artifact_id: null,
+      sha256: null,
+      format: occurrence.artifact_format,
+      encrypted: occurrence.encrypted,
+      limitations: occurrence.limitations,
+    }));
 
-/** Unicode code point ordering so projection arrays sort deterministically. */
-export const compareProjectionStrings = (
-  left: string,
-  right: string,
-): number => (left < right ? -1 : left > right ? 1 : 0);
+export { bridgeCandidateCoverageSchema, projectCartesianCandidates };
 
 /** Digest a canonical JSON projection payload for its stable identifier. */
 export const projectionDigest = (value: unknown, label: string): string => {

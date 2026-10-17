@@ -16,6 +16,7 @@ import { logCliCommand } from "../cliLogging.js";
 import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { registerProjectManagedApplicationGraph } from "./managedProjectGraphCommand.js";
+import { managedMembersInputSchema } from "../contracts/managed/managedToolContracts.js";
 
 export const registerManagedCommands = (
   cli: CliInstance,
@@ -55,17 +56,14 @@ const registerInspectManagedMembers = (
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedMembers, {
     description:
-      "Inspect PE/CLI metadata members, signatures, and CIL anchors without loading target code",
+      "Inspect PE/CLI metadata members, signatures, CIL anchors, and ldstr string literals without loading target code",
     args: z.object({
       path: z.string().describe("Managed PE executable or assembly path"),
     }),
     options: z.object({
-      type: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "Inspect only members declared by this exact type full name, such as System.Threading.Monitor; a nested type is named by its bare name, which selects every nested type of that name (repeatable)",
-        ),
+      type: managedMembersInputSchema.shape.type_names.describe(
+        "Inspect only members declared by this exact type full name, and the string literals they load, such as System.Threading.Monitor; a nested type is named by its bare name, which selects every nested type of that name (repeatable)",
+      ),
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, "inspect-managed-members", () =>

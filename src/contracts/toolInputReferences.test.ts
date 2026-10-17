@@ -3,7 +3,12 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
-import { presentInputJsonSchema } from "./inputSchemaPresentation.js";
+import {
+  advertisedReferenceExpansionBudget,
+  countLocalReferenceExpansions,
+  inputSchemaWithinReferenceExpansionBudget,
+  presentInputJsonSchema,
+} from "./inputSchemaPresentation.js";
 import { toolContract } from "./toolContracts.js";
 import { toolInputSchemaWithMetadata } from "./toolSchemaMetadata.js";
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "./javascript/javascriptRuntimeReconciliationExample.js";
@@ -35,7 +40,41 @@ it.each(["draft-2020-12", "draft-07"] as const)(
   },
 );
 
-describe("advertised input references", () => {
+describe("advertised object dependencies", () => {
+  it.each([
+    ["draft-07", "dependencies"],
+    ["draft-2020-12", "dependentRequired"],
+  ] as const)(
+    "presents object-group dependencies as guidance without unsupported dialect keywords (%s)",
+    (dialect, dependencyKeyword) => {
+      const advertised = presentInputJsonSchema(
+        {
+          $schema:
+            dialect === "draft-07"
+              ? "http://json-schema.org/draft-07/schema#"
+              : "https://json-schema.org/draft/2020-12/schema",
+          type: "object",
+          properties: { url: { type: "string" }, body: { type: "string" } },
+          required: ["body"],
+          [dependencyKeyword]: { body: ["url"] },
+        },
+        () => undefined,
+      );
+      expect(advertised.$schema).toBe(
+        dialect === "draft-07"
+          ? "http://json-schema.org/draft-07/schema#"
+          : "https://json-schema.org/draft/2020-12/schema",
+      );
+      expect(advertised).not.toHaveProperty("dependencies");
+      expect(advertised).not.toHaveProperty("dependentRequired");
+      expect(advertised.description).toContain(
+        "When body is provided, also provide url.",
+      );
+    },
+  );
+});
+
+describe("advertised production selector contracts", () => {
   it.each(["draft-2020-12", "draft-07"] as const)(
     "preserves production native-selector constraints in %s",
     (target) => {
@@ -84,7 +123,9 @@ describe("advertised input references", () => {
       expect(validate(unexpected)).toBe(false);
     },
   );
+});
 
+describe("advertised schema metadata and validation", () => {
   it.each(["draft-2020-12", "draft-07"] as const)(
     "retains specialized descriptions, literal metadata and strict validation in %s",
     (target) => {
@@ -166,6 +207,105 @@ describe("advertised input references", () => {
   );
 });
 
+describe("advertised reference expansion budget", () => {
+  it("counts references in keyword-named fields, excluding literals", () => {
+    const fields = ["default", "enum", "examples", "const", "$defs"];
+    const schema = {
+      type: "object",
+      properties: Object.fromEntries(
+        fields.map((name) => [name, { $ref: "#/$defs/value" }]),
+      ),
+      $defs: { value: { type: "string" } },
+      default: { $ref: "#/$defs/value" },
+      examples: [{ $ref: "#/$defs/value" }],
+    };
+    expect(countLocalReferenceExpansions(schema)).toBe(fields.length);
+  });
+  const reusedComponent = z
+    .object({ kind: z.literal("rec"), value: z.string() })
+    .strict();
+  const inputWithReusedFields = (count: number) =>
+    z.strictObject(
+      Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [
+          `field_${String(index).padStart(2, "0")}`,
+          reusedComponent,
+        ]),
+      ),
+    );
+  const advertisedInput = (
+    canonical: z.ZodType<Readonly<Record<string, unknown>>>,
+  ) =>
+    toolInputSchemaWithMetadata({
+      ...toolContract("open_binary"),
+      inputSchema: canonical,
+    })["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+
+  it("keeps shared definitions while every client can resolve them", () => {
+    const advertised = advertisedInput(inputWithReusedFields(8));
+    expect(advertised.$defs).toBeDefined();
+    expect(countLocalReferenceExpansions(advertised)).toBe(8);
+  });
+
+  it("keeps shared definitions exactly at the budget", () => {
+    const advertised = advertisedInput(
+      inputWithReusedFields(advertisedReferenceExpansionBudget),
+    );
+    expect(advertised.$defs).toBeDefined();
+    expect(countLocalReferenceExpansions(advertised)).toBe(
+      advertisedReferenceExpansionBudget,
+    );
+  });
+
+  it("re-projects without shared definitions once the budget is exceeded", () => {
+    const advertised = advertisedInput(
+      inputWithReusedFields(advertisedReferenceExpansionBudget + 1),
+    );
+    expect(advertised.$defs).toBeUndefined();
+    expect(countLocalReferenceExpansions(advertised)).toBe(0);
+    const properties = advertised.properties as Record<string, unknown>;
+    expect(properties.field_00).toMatchObject({
+      type: "object",
+      properties: { kind: { const: "rec" }, value: { type: "string" } },
+      required: ["kind", "value"],
+    });
+  });
+
+  it("keeps the shared form untouched when it fits and swaps it when not", () => {
+    const shared = {
+      type: "object",
+      properties: { value: { $ref: "#/$defs/shared" } },
+      $defs: { shared: { type: "string" } },
+    };
+    const inlined = {
+      type: "object",
+      properties: { value: { type: "string" } },
+    };
+    expect(
+      inputSchemaWithinReferenceExpansionBudget(
+        shared,
+        () => inlined,
+        advertisedReferenceExpansionBudget,
+      ),
+    ).toBe(shared);
+    expect(
+      inputSchemaWithinReferenceExpansionBudget(
+        {
+          ...shared,
+          properties: Object.fromEntries(
+            Array.from({ length: 33 }, (_, index) => [
+              `field_${index}`,
+              { $ref: "#/$defs/shared" },
+            ]),
+          ),
+        },
+        () => inlined,
+        advertisedReferenceExpansionBudget,
+      ),
+    ).toBe(inlined);
+  });
+});
+
 describe("root input presentation", () => {
   it("preserves prototype-named properties in object-root presentation", () => {
     const fields = Object.fromEntries([
@@ -235,12 +375,20 @@ describe("root input presentation", () => {
         { before: "first" },
         { unexpected: true },
         { before_scenario: 1, after_scenario: "wrong" },
-        { before_scenario: 1, normalization: true },
-        { after_scenario: 2, normalization: true },
       ]) {
         expect(schema.safeParse(input).success).toBe(false);
         expect(validate(input)).toBe(false);
       }
+      // The vendor-safe advertisement uses group guidance instead of
+      // dependentRequired; the canonical runtime parser keeps exact unions.
+      expect(
+        schema.safeParse({ before_scenario: 1, normalization: true }).success,
+      ).toBe(false);
+      expect(validate({ before_scenario: 1, normalization: true })).toBe(true);
+      expect(
+        schema.safeParse({ after_scenario: 2, normalization: true }).success,
+      ).toBe(false);
+      expect(validate({ after_scenario: 2, normalization: true })).toBe(true);
       // Cross-group exclusion is enforced only by the canonical runtime parser.
       const mixed = {
         before: "first",

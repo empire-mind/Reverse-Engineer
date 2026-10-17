@@ -13,15 +13,45 @@ const RESULT_ENVELOPE_BYTES =
     }),
   ) - 4;
 
-const TEXT_RESULT_ENVELOPE_BYTES = Buffer.byteLength(
-  JSON.stringify({ content: [{ type: "text", text: "" }] }),
+const ERROR_RESULT_ENVELOPE_BYTES = Buffer.byteLength(
+  JSON.stringify({ content: [{ type: "text", text: "" }], isError: true }),
 );
 
 /**
- * MCP representations a result carries on the wire. Successful results repeat
- * the JSON as structured content and escaped text; error results carry text only.
+ * Result metadata marking content that originates from the analysis target.
+ * Hosts and hooks can read it to treat the result as untrusted data.
  */
-export type ToolResultRepresentations = "structured-and-text" | "text";
+export const TARGET_CONTENT_RESULT_META = Object.freeze({
+  provenance: Object.freeze({
+    untrusted_content: true,
+    source: "analysis_target",
+  }),
+});
+
+/** Whether a delivered tool result already carries the untrusted target-content marker. */
+export const carriesTargetContentMarker = (result: {
+  readonly _meta?: unknown;
+}): boolean => {
+  const meta = result._meta;
+  if (typeof meta !== "object" || meta === null) return false;
+  const provenance: unknown = Reflect.get(meta, "provenance");
+  return (
+    typeof provenance === "object" &&
+    provenance !== null &&
+    Reflect.get(provenance, "untrusted_content") === true
+  );
+};
+
+// `,"_meta":{...}` added to the delivered result object.
+const TARGET_CONTENT_META_BYTES =
+  Buffer.byteLength(JSON.stringify({ _meta: TARGET_CONTENT_RESULT_META })) - 1;
+
+/**
+ * MCP representations a result carries on the wire. Successful results repeat
+ * the JSON as structured content and escaped text; error results carry text
+ * only, plus their `isError` flag.
+ */
+export type ToolResultRepresentations = "structured-and-text" | "error-text";
 
 /** Result of encoding the complete repeated MCP representations within a wire budget. */
 export type ToolResultEncoding =
@@ -33,15 +63,38 @@ export type ToolResultEncoding =
       readonly constraint: "receive-buffer" | "string-length";
     };
 
+/** Measure an already-formed MCP result object without allocating its JSON text. */
+export const measureMcpResultWithinBudget = (
+  value: unknown,
+  budgetBytes: number,
+):
+  | { readonly ok: true; readonly bytes: number }
+  | {
+      readonly ok: false;
+      readonly bytesAtLeast: number;
+      readonly constraint: "receive-buffer";
+    } => {
+  let bytes = 0;
+  for (const part of bufferedJsonParts(jsonParts(value))) {
+    bytes += Buffer.byteLength(part);
+    if (bytes > budgetBytes)
+      return { ok: false, bytesAtLeast: bytes, constraint: "receive-buffer" };
+  }
+  return { ok: true, bytes };
+};
+
 /** Account for the delivered JSON representations before allocating the complete text. */
 export const encodeToolResult = (
   value: JsonValue,
   budgetBytes: number,
   representations: ToolResultRepresentations = "structured-and-text",
+  targetContent = false,
 ): ToolResultEncoding => {
   const structured = representations === "structured-and-text";
   const parts: string[] = [];
-  let bytes = structured ? RESULT_ENVELOPE_BYTES : TEXT_RESULT_ENVELOPE_BYTES;
+  let bytes =
+    (structured ? RESULT_ENVELOPE_BYTES : ERROR_RESULT_ENVELOPE_BYTES) +
+    (targetContent ? TARGET_CONTENT_META_BYTES : 0);
   let codeUnits = bytes;
   for (const part of bufferedJsonParts(jsonParts(value))) {
     const escapedPart = JSON.stringify(part);

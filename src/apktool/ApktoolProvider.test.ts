@@ -17,7 +17,7 @@ import type { ApktoolRequest } from "../domain/apktool/apktoolResourceAnalysis.j
 
 const it = test.skipIf(process.platform === "win32");
 
-const VERSION_BLOCK = "printf '2.7.0-stub\\n'";
+const VERSION_BLOCK = "printf '2.7.0-dirty\\n'";
 
 const REAL_YML = [
   "!!brut.androlib.meta.MetaInfo",
@@ -96,14 +96,21 @@ const decodeStub = (
     readonly withStrings?: boolean;
     readonly withGerman?: boolean;
     readonly failDecode?: boolean;
+    readonly ymlFile?: string;
     readonly manifestFile?: string;
     readonly stringsFile?: string;
     readonly stringsXml?: string;
+    readonly extraValuesDirectories?: readonly string[];
   } = {},
 ): ((root: string) => string) => {
   const withStrings = options.withStrings ?? true;
   const withGerman = options.withGerman ?? true;
+  const extraValuesDirectories = options.extraValuesDirectories ?? [];
   const stringsXml = options.stringsXml ?? REAL_STRINGS;
+  const ymlWrite =
+    options.ymlFile === undefined
+      ? `printf '%s\\n' '${REAL_YML.replace(/'/gu, "'\\''")}' > "$5/apktool.yml"`
+      : `cp '${options.ymlFile}' "$5/apktool.yml"`;
   const manifestWrite =
     options.manifestFile === undefined
       ? `printf '%s\\n' '${REAL_MANIFEST.replace(/'/gu, "'\\''")}' > "$5/AndroidManifest.xml"`
@@ -112,16 +119,23 @@ const decodeStub = (
     options.stringsFile === undefined
       ? `printf '%s\\n' '${stringsXml.replace(/'/gu, "'\\''")}' > "$5/res/values/strings.xml"`
       : `cp '${options.stringsFile}' "$5/res/values/strings.xml"`;
+  const qualifierStrings = extraValuesDirectories
+    .map(
+      (name) =>
+        `printf '%s\\n' '<resources><string name="wrong">Wrong</string></resources>' > "$5/res/values-${name}/strings.xml"`,
+    )
+    .join("\\n  ");
   return () => `if [ "$1" = "--version" ]; then ${VERSION_BLOCK}; exit 0; fi
 if [ "$1" = "d" ]; then
   ${
     options.failDecode === true
       ? `printf 'Exception in thread "main" brut.androlib.AndrolibException: Could not decode the APK\\n' >&2; exit 1;`
-      : `printf '%s\\n' '${REAL_YML.replace(/'/gu, "'\\''")}' > "$5/apktool.yml"
+      : `${ymlWrite}
   ${manifestWrite}
-  mkdir -p "$5/res/values"${withGerman ? ' "$5/res/values-de"' : ""}
+  mkdir -p "$5/res/values"${withGerman ? ' "$5/res/values-de"' : ""}${extraValuesDirectories.map((name) => ` "$5/res/values-${name}"`).join("")}
   ${withStrings ? stringsWrite : ""}
   ${withGerman ? `printf '%s\\n' '${DE_STRINGS.replace(/'/gu, "'\\''")}' > "$5/res/values-de/strings.xml"` : ""}
+  ${qualifierStrings}
   printf 'I: Using Apktool on stub\\n'
   exit 0`
   }
@@ -158,7 +172,7 @@ it("inspects the apktool launcher", async () => {
   expect(result.client).toEqual({
     command,
     command_source: "environment",
-    apktool_version: "2.7.0-stub",
+    apktool_version: "2.7.0-dirty",
   });
 });
 
@@ -192,6 +206,47 @@ it("decodes resources with target identity, metadata, and strings", async () => 
   expect(result.coverage).toBe("complete");
 });
 
+it.each([
+  {
+    name: "malformed UTF-8",
+    bytes: Buffer.concat([
+      Buffer.from("versionInfo:\n  versionName: com."),
+      Buffer.from([0xff]),
+      Buffer.from(".app\n"),
+    ]),
+    valid: false,
+  },
+  {
+    name: "a literal replacement character",
+    bytes: Buffer.from("versionInfo:\n  versionName: com.�.app\n", "utf8"),
+    valid: true,
+  },
+])("handles $name in producer metadata", async ({ bytes, valid }) => {
+  const { command, root } = await writeApktoolStub((root) =>
+    decodeStub({ ymlFile: join(root, "malformed-apktool.yml") })(root),
+  );
+  await writeFile(join(root, "malformed-apktool.yml"), bytes);
+  const apk = await apkFixture(root);
+  if (valid) {
+    const result = await evidenceResult(providerOver(command), {
+      operation: "decode_android_resources",
+      input: { path: apk.path, include_strings: false },
+    });
+    expect(result.metadata).toMatchObject({ version_name: "com.�.app" });
+    expect(result.coverage).toBe("complete");
+    return;
+  }
+  const result = await providerOver(command).execute({
+    operation: "decode_android_resources",
+    input: { path: apk.path, include_strings: false },
+  });
+  if (result.ok) throw new Error("expected invalid producer output");
+  const projected = projectAnalysisError(result.error);
+  expect(projected).toMatchObject({ code: "unreadable_output" });
+  expect(result.error.message).toContain("invalid UTF-8");
+  expect(result.error.message).toContain("apktool.yml");
+});
+
 it("preserves empty resource strings and reports markup omissions as partial", async () => {
   const stringsXml =
     '<resources><string name="empty"/><string name="raw">  A &amp; B  </string><string name="styled">Hello <b>world</b></string></resources>';
@@ -207,6 +262,30 @@ it("preserves empty resource strings and reports markup omissions as partial", a
   ]);
   expect(result.coverage).toBe("partial");
 });
+
+it("ignores Android resource qualifiers when discovering locales", async () => {
+  const { command, root } = await writeApktoolStub(
+    decodeStub({ extraValuesDirectories: ["car", "night", "v21"] }),
+  );
+  const apk = await apkFixture(root);
+  const result = await evidenceResult(providerOver(command), {
+    operation: "decode_android_resources",
+    input: { path: apk.path, include_strings: true },
+  });
+  expect(result.locales).toEqual(["de"]);
+});
+
+it.each(["car", "night", "v21"])(
+  "rejects %s as a requested locale",
+  (locale) => {
+    expect(
+      apktoolRequestSchema.safeParse({
+        operation: "decode_android_resources",
+        input: { path: "/tmp/probe.apk", locale },
+      }).success,
+    ).toBe(false);
+  },
+);
 
 it("projects one locale's strings on request", async () => {
   const { command, root } = await writeApktoolStub(decodeStub());
@@ -273,6 +352,39 @@ it("reports a missing launcher as a capability gap with recovery", async () => {
   expect(projected.details).toMatchObject({
     provider_id: "apktool",
     reason: expect.stringContaining("REA_APKTOOL_COMMAND") as unknown,
+  });
+});
+
+it("fails closed for unrecognized and unsupported Apktool versions", async () => {
+  const invalidOutput = `unexpected Apktool output ${"x".repeat(700)}\n`;
+  const unrecognized = await writeApktoolStub(
+    () => `printf '%s' '${invalidOutput}'; exit 0`,
+  );
+  await expect(
+    providerOver(unrecognized.command).inspectAvailability(),
+  ).resolves.toMatchObject({
+    status: "unavailable",
+    code: "version_unresolved",
+    diagnostics: {
+      reported_version: invalidOutput.trim(),
+      stdout: invalidOutput,
+    },
+  });
+
+  const old = await writeApktoolStub(() => `printf '2.6.3\\n'`);
+  await expect(
+    providerOver(old.command).inspectAvailability(),
+  ).resolves.toMatchObject({
+    status: "unavailable",
+    code: "unsupported_version",
+  });
+
+  const prerelease = await writeApktoolStub(() => `printf '2.7.0-beta.1\\n'`);
+  await expect(
+    providerOver(prerelease.command).inspectAvailability(),
+  ).resolves.toMatchObject({
+    status: "unavailable",
+    code: "unsupported_version",
   });
 });
 

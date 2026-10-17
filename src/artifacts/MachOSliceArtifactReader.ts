@@ -8,11 +8,11 @@ import {
   type NativeCommandRunner,
 } from "../native/CommandRunner.js";
 import {
-  lipoSubtypeBits,
-  parseLipoArchitectures,
+  parseLipoOutput,
   type LipoArchitecture,
 } from "../native/parsers/lipo.js";
 import type { MachoSlice } from "../domain/apple/dylibResolution.js";
+import { machoCpuSubtypeBase } from "../domain/apple/machoCpuIdentity.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { readMachoImage, type ReadAt } from "./apple/MachoLoadCommandReader.js";
 import {
@@ -81,7 +81,9 @@ export class MachOSliceArtifactReader implements ArtifactReader {
     if (!captured.ok)
       throw new ArtifactReaderFailure(
         captured.error.reason === "cancelled" ? "cancelled" : "unavailable",
-        "lipo could not enumerate universal Mach-O slices",
+        captured.error.detail === null
+          ? "lipo could not enumerate universal Mach-O slices"
+          : `lipo could not enumerate universal Mach-O slices: ${captured.error.detail}`,
         {
           cause: captured.error,
           ...(captured.error.cleanupFailure === null &&
@@ -112,7 +114,7 @@ export class MachOSliceArtifactReader implements ArtifactReader {
     };
     await this.#verifySource(source);
     const fileSize = source.initial.size;
-    const architectures = parseLipoArchitectures(captured.value.stdout);
+    const { architectures } = parseLipoOutput(captured.value.stdout, this.path);
     const structural = await readStructuralSlices(source.handle, fileSize);
     await this.#verifySource(source);
     if (structural.status === "malformed")
@@ -120,9 +122,16 @@ export class MachOSliceArtifactReader implements ArtifactReader {
         "integrity",
         `Mach-O structural slice index is malformed: ${structural.reason}`,
       );
-    if (structural.status === "unsupported")
+    // A valid universal binary can hold slices REA cannot index, such as
+    // big-endian PowerPC. lipo's own ranges still inventory every slice.
+    if (
+      structural.status === "unsupported" &&
+      architectures.some(
+        ({ file_offset, size }) => file_offset === null || size === null,
+      )
+    )
       throw new ArtifactReaderFailure(
-        "format",
+        "unavailable",
         `Mach-O structural slice index is unsupported: ${structural.reason}`,
       );
     const slices = structural.status === "parsed" ? structural.slices : null;
@@ -183,7 +192,11 @@ export class MachOSliceArtifactReader implements ArtifactReader {
             ? [
                 "Structural Mach-O facts were unavailable; slice range is based on lipo output.",
               ]
-            : []),
+            : structural.status === "unsupported"
+              ? [
+                  `Structural Mach-O facts were unsupported (${structural.reason}); slice range is based on lipo output.`,
+                ]
+              : []),
           ...(architecture.file_offset === null || architecture.size === null
             ? [
                 "Slice range was derived from structural Mach-O facts because lipo omitted it.",
@@ -469,8 +482,10 @@ const lipoSubtypeMatches = (
 ): boolean => {
   if (reported.cpu_subtype_code !== null)
     return reported.cpu_subtype_code === observedCpuSubtype;
-  const bits = lipoSubtypeBits(reported.cpu_subtype);
-  return bits === null || bits === (observedCpuSubtype & 0x00ffffff);
+  return (
+    reported.cpu_subtype_base === null ||
+    reported.cpu_subtype_base === machoCpuSubtypeBase(observedCpuSubtype)
+  );
 };
 
 /**

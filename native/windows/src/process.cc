@@ -68,6 +68,18 @@ static ULONGLONG jobMemoryLimit(napi_env env, napi_value value) {
   return limit;
 }
 
+// An affinity mask is meaningful only inside one processor group, so only a
+// process occupying exactly one group has a group a child can inherit. A
+// process whose threads span groups, or whose membership cannot be read, has no
+// single group.
+static bool singleProcessorGroup(HANDLE process, USHORT& group) {
+  USHORT count = 1;
+  std::array<USHORT, 1> groups{};
+  if (!GetProcessGroupAffinity(process, &count, groups.data()) || count != 1) return false;
+  group = groups[0];
+  return true;
+}
+
 static void pipe(Handle& read, Handle& write, bool parentReads = true) {
   SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
   HANDLE rawRead, rawWrite;
@@ -168,11 +180,27 @@ std::unique_ptr<Process> spawnProcess(const std::wstring& command, const std::ws
   TOKEN_OWNER owner{reinterpret_cast<TOKEN_USER*>(tokenUser.data())->User.Sid};
   require(SetTokenInformation(token.get(), TokenOwner, &owner, sizeof(owner)),
           "Set suspended process file owner failed", command);
+  // A mask names processors inside one processor group, and Windows assigns a
+  // new process to a group of its own choosing, so a mask belonging to another
+  // group is rejected (ERROR_INVALID_PARAMETER). An unconstrained caller, whose
+  // mask is its group's whole active set, asks for no bound the child's own
+  // group cannot give, so such a child keeps that group's default and the spawn
+  // proceeds. A narrower mask is a deliberate CPU constraint that a child in
+  // another group cannot express, and silently widening it would hand the
+  // provider tree the whole group, so that spawn fails naming the constraint.
   DWORD_PTR affinity = 0, systemAffinity = 0;
   require(GetProcessAffinityMask(GetCurrentProcess(), &affinity, &systemAffinity),
           "Read caller process affinity failed", command);
-  if (affinity != 0)
+  USHORT callerGroup = 0, childGroup = 0;
+  const bool sharedGroup = singleProcessorGroup(GetCurrentProcess(), callerGroup) &&
+                           singleProcessorGroup(result->process.get(), childGroup) &&
+                           callerGroup == childGroup;
+  if (affinity != 0 && sharedGroup)
     require(SetProcessAffinityMask(result->process.get(), affinity), "Preserve caller process affinity failed", command);
+  else
+    require(affinity == 0 || affinity == systemAffinity,
+            "Caller CPU affinity cannot bound an owned process in another processor group", command,
+            ERROR_INVALID_PARAMETER);
   const DWORD priority = GetPriorityClass(GetCurrentProcess());
   require(priority != 0 && SetPriorityClass(result->process.get(), priority),
           "Preserve caller process priority failed", command);
@@ -186,18 +214,32 @@ std::unique_ptr<Process> spawnProcess(const std::wstring& command, const std::ws
 }
 
 static napi_value readOutput(napi_env env, Handle& read, bool& ended) {
-  std::array<unsigned char, 65536> bytes;
-  DWORD available = 0, count = 0;
+  constexpr size_t kMaximumReadPerPoll = 1024 * 1024;
+  std::array<unsigned char, 65536> chunk;
+  std::vector<unsigned char> bytes;
   if (!read.valid()) ended = true;
-  else if (!PeekNamedPipe(read.get(), nullptr, 0, nullptr, &available, nullptr)) {
-    require(GetLastError() == ERROR_BROKEN_PIPE, "Observe owned process output failed");
-    read.reset(); ended = true;
-  } else if (available > 0) {
-    require(ReadFile(read.get(), bytes.data(), std::min<DWORD>(available, bytes.size()), &count, nullptr),
-            "Read owned process output failed");
+  else {
+    while (bytes.size() < kMaximumReadPerPoll) {
+      DWORD available = 0;
+      if (!PeekNamedPipe(read.get(), nullptr, 0, nullptr, &available, nullptr)) {
+        require(GetLastError() == ERROR_BROKEN_PIPE,
+                "Observe owned process output failed");
+        read.reset();
+        ended = true;
+        break;
+      }
+      if (available == 0) break;
+      const auto requested = static_cast<DWORD>(std::min<size_t>(
+          {available, chunk.size(), kMaximumReadPerPoll - bytes.size()}));
+      DWORD count = 0;
+      require(ReadFile(read.get(), chunk.data(), requested, &count, nullptr) &&
+                  count > 0,
+              "Read owned process output failed");
+      bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + count);
+    }
   }
   napi_value result;
-  check(napi_create_buffer_copy(env, count, bytes.data(), nullptr, &result));
+  check(napi_create_buffer_copy(env, bytes.size(), bytes.data(), nullptr, &result));
   return result;
 }
 
@@ -436,6 +478,7 @@ napi_value inspect(napi_env env, std::unique_ptr<Runtime>& probe) {
   set(env, result, "architecture", string(env, std::string("x64")));
   set(env, result, "filesystem", filesystem);
   set(env, result, "privateDacl", boolean(env, true));
+  set(env, result, "privateBridgeDescriptorAccess", boolean(env, true));
   set(env, result, "atomicJobAssignment", boolean(env, true));
   set(env, result, "killOnOwnerClose", boolean(env, true));
   set(env, result, "protocolStdin", boolean(env, true));

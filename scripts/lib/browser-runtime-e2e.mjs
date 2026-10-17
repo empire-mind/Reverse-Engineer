@@ -3,23 +3,21 @@ import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { access } from "node:fs/promises";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { CdpBrowserProvider } from "../../dist/browser/CdpBrowserProvider.js";
+import { listBrowserTargetsInputSchema } from "../../dist/domain/browserObservation.js";
 import { CdpConnection } from "../../dist/browser/CdpConnection.js";
-import { waitForBrowserDevtoolsPort } from "../../dist/browser/BrowserProcessStartup.js";
 import { parseEvidence } from "../../dist/domain/evidence.js";
 import { webExecutionSchema } from "../../dist/domain/webExecution.js";
 import { webEventListenersSchema } from "../../dist/domain/webEventListeners.js";
 import { startBrowserRuntimeSite } from "../fixtures/browser-runtime-site.mjs";
+import { requireOrdinaryWindowsVerifierCaller } from "./windows-ordinary-user-verifier.mjs";
 import { mcpTextValue } from "./mcp-verifier-results.mjs";
-import {
-  startRuntimeFixtureBrowser,
-  closeRuntimeFixtureResources,
-} from "./browser-runtime-fixture-lifecycle.mjs";
+import { startRuntimeFixtureBrowser } from "./browser-runtime-fixture-lifecycle.mjs";
+import { closeVerifierResources } from "./verifier-cleanup.mjs";
 import { verifyRuntimeTargetTermination } from "./browser-runtime-termination-e2e.mjs";
 import { verifyRuntimeInvalidSelectors } from "./browser-runtime-selector-e2e.mjs";
 import {
@@ -38,31 +36,22 @@ export async function verifyBrowserRuntime(
   executable,
   entrypoint = fileURLToPath(new URL("../rea.mjs", import.meta.url)),
 ) {
+  await requireOrdinaryWindowsVerifierCaller();
   await access(executable);
   const site = await startBrowserRuntimeSite();
   let fixture;
   let primaryError;
-  let stderr = "";
   let action;
   let client;
   try {
     fixture = await startRuntimeFixtureBrowser(executable, site.origin);
-    const { browser, profile } = fixture;
-    browser.stderr.on("data", (chunk) => {
-      if (stderr.length < 65536) stderr += chunk;
-    });
-    const port = await waitForBrowserDevtoolsPort({
-      child: browser,
-      executable,
-      activePortPath: join(profile, "DevToolsActivePort"),
-      stderr: () => stderr,
-      timeoutMs: 20_000,
-    });
-    const endpoint = `http://127.0.0.1:${port}`;
-    const targets = await new CdpBrowserProvider().listTargets({
-      cdp_endpoint: endpoint,
-      allowed_origins: [site.origin],
-    });
+    const endpoint = `http://127.0.0.1:${fixture.port}`;
+    const targets = await new CdpBrowserProvider().listTargets(
+      listBrowserTargetsInputSchema.parse({
+        cdp_endpoint: endpoint,
+        allowed_origins: [site.origin],
+      }),
+    );
     if (!targets.ok) throw targets.error;
     const target = targets.value.targets[0];
     assert.ok(target, "owned fixture page target missing");
@@ -191,7 +180,7 @@ export async function verifyBrowserRuntime(
     primaryError = cause;
     throw cause;
   } finally {
-    await closeRuntimeFixtureResources(
+    await closeVerifierResources(
       [
         () => client?.close(),
         () => action?.close(),

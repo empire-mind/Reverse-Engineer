@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { realpath } from "node:fs/promises";
 
 import { err, ok, type Result } from "../domain/result.js";
+import { DarwinProcessOwnershipInspectionError } from "../process/DarwinProcessRunTokenReader.js";
 import {
   OwnedCommandFailure,
   runOwnedCommand,
@@ -14,11 +15,18 @@ import type {
   ProviderProcessSupervisor,
   SpawnedOwnedProviderProcess,
 } from "../process/ProviderProcess.js";
+import { boundedUtf8Text } from "../process/boundedUtf8Text.js";
 
 /** Maximum wall-clock duration for one native command. */
 export const NATIVE_COMMAND_TIMEOUT_MS = 60_000;
 /** Retain complete command output up to a bounded aggregate size. */
 export const NATIVE_COMMAND_OUTPUT_BUDGET_BYTES = 64 * 1024 * 1024;
+/**
+ * Failure diagnostics keep only an excerpt of each stream. Successful
+ * analysis needs complete output, but a failed command's error would
+ * otherwise repeat up to the whole output budget to the caller.
+ */
+export const NATIVE_FAILURE_DIAGNOSTIC_BYTES = 64 * 1024;
 
 export interface NativeCommandCapture {
   readonly tool: string;
@@ -39,6 +47,7 @@ export interface NativeCommandCapture {
 export class NativeCommandFailure extends Error {
   readonly cleanupOwner: ProviderProcessSupervisor | undefined;
   readonly cleanupFailures: readonly NativeCommandCleanupFailure[];
+  readonly detail: string | null;
 
   constructor(
     readonly tool: string,
@@ -58,6 +67,7 @@ export class NativeCommandFailure extends Error {
     super(`Native command ${tool} failed: ${reason}`, options);
     this.cleanupOwner = options?.cleanupOwner;
     this.cleanupFailures = options?.cleanupFailures ?? [];
+    this.detail = options?.detail ?? null;
   }
 }
 
@@ -67,6 +77,8 @@ export interface NativeCommandFailureOptions extends ErrorOptions {
   readonly cleanupOwner?: ProviderProcessSupervisor;
   /** All owners still incomplete after a preflight retry blocked this command. */
   readonly cleanupFailures?: readonly NativeCommandCleanupFailure[];
+  /** Host-side reason the command could not be supervised, such as a missing ownership helper compiler. */
+  readonly detail?: string;
 }
 
 /** One failed cleanup attempt; the runner retains `owner` until it is verified stopped. */
@@ -310,6 +322,9 @@ export const resolveXcrunTool = async (
           ...(found.error.cleanupFailures.length === 0
             ? {}
             : { cleanupFailures: found.error.cleanupFailures }),
+          ...(found.error.detail === null
+            ? {}
+            : { detail: found.error.detail }),
         },
         found.error.capture,
         found.error.cleanupFailure,
@@ -375,18 +390,30 @@ type ProcessCapture = Omit<
   | "arguments"
 >;
 
-const failureCapture = (
+/** Bound one command's output for failure diagnostics, keeping observed byte totals. */
+export const failureCapture = (
   capture: ProcessCapture,
   truncated: boolean,
-): NativeCommandFailureCapture => ({
-  stdout: capture.stdout,
-  stderr: capture.stderr,
-  stdoutBytes: capture.stdoutBytes,
-  stderrBytes: capture.stderrBytes,
-  exitCode: capture.exitCode,
-  signal: capture.signal,
-  truncated,
-});
+): NativeCommandFailureCapture => {
+  const stdout = boundedUtf8Text(
+    capture.stdout,
+    NATIVE_FAILURE_DIAGNOSTIC_BYTES,
+  );
+  const stderr = boundedUtf8Text(
+    capture.stderr,
+    NATIVE_FAILURE_DIAGNOSTIC_BYTES,
+  );
+  return {
+    stdout: stdout.text,
+    stderr: stderr.text,
+    // Byte counts stay the observed totals, not the excerpt lengths.
+    stdoutBytes: capture.stdoutBytes,
+    stderrBytes: capture.stderrBytes,
+    exitCode: capture.exitCode,
+    signal: capture.signal,
+    truncated: truncated || stdout.truncated || stderr.truncated,
+  };
+};
 
 const captureProcess = async (
   executable: string,
@@ -449,7 +476,16 @@ const captureProcess = async (
         ),
       );
     }
-    return err(new NativeCommandFailure(tool, "io", null, { cause }));
+    return err(
+      new NativeCommandFailure(tool, "io", null, {
+        cause,
+        // Process supervision needs the Darwin ownership helper; its typed
+        // message names the compiler or SDK prerequisite to fix.
+        ...(cause instanceof DarwinProcessOwnershipInspectionError
+          ? { detail: cause.message }
+          : {}),
+      }),
+    );
   }
 };
 

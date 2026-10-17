@@ -1,4 +1,5 @@
 import { posix } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { parseExpression } from "@babel/parser";
 import { describe, expect, it } from "vitest";
@@ -38,6 +39,9 @@ const anchoredExpressions = [
   ["path.resolve(__dirname)", "."],
   ['path.posix.resolve(`/app`, `/shared`, "preload.js")', "/shared/preload.js"],
   ['path.posix.resolve("" + "/app", "preload.js")', "/app/preload.js"],
+  ['__dirname + "/preload.js"', "preload.js"],
+  ['__dirname + "/" + "preload.js"', "preload.js"],
+  ['path.dirname(__filename) + "/lib" + "/preload.js"', "lib/preload.js"],
 ] as const;
 
 const unknownExpressions = [
@@ -58,6 +62,8 @@ const unknownExpressions = [
   'path.win32.resolve(__dirname, "preload.js")',
   'win32.resolve("/app", "preload.js")',
   'resolve("/app", "preload.js")',
+  '__dirname + "preload.js"',
+  'path.dirname(__filename) + "preload.js"',
 ];
 
 describe("inert JavaScript path resolution", () => {
@@ -101,6 +107,16 @@ describe("inert JavaScript path resolution", () => {
       "filesystem-expression",
     ],
     [
+      'path.join(__dirname, "/preload.js")',
+      "preload.js",
+      "filesystem-expression",
+    ],
+    [
+      'path.join(dirname(fileURLToPath(import.meta.url)), "/lib", "/preload.js")',
+      "lib/preload.js",
+      "filesystem-expression",
+    ],
+    [
       'path.join("ignored", __dirname, "preload.js")',
       "ignored/preload.js",
       "filesystem-expression",
@@ -111,6 +127,7 @@ describe("inert JavaScript path resolution", () => {
       "filesystem-expression",
     ],
     ['join("sub", "preload.js")', "sub/preload.js", "module-specifier"],
+    ["path.join(__dirname)", ".", "filesystem-expression"],
   ] as const)("preserves join behavior in %s", (expression, path, context) => {
     assertPathProjection(expression, path, context);
   });
@@ -182,7 +199,6 @@ describe("inert JavaScript path resolution", () => {
 
   it.each([
     "path.join()",
-    "path.join(__dirname)",
     'path.join("/app", runtimeFile)',
     "path.join(...parts)",
   ])("preserves unresolved join syntax in %s", (expression) =>
@@ -191,6 +207,32 @@ describe("inert JavaScript path resolution", () => {
     ).toBeUndefined(),
   );
 });
+
+it.each([
+  "file:///app/preload%20file.js",
+  "file:///app/%E2%9C%93.js",
+  "file:///app/preload.js?query=1#fragment",
+])("decodes literal file URL %s as a filesystem expression", (url) => {
+  assertPathProjection(
+    `fileURLToPath(${JSON.stringify(url)})`,
+    fileURLToPath(url, { windows: false }),
+    "filesystem-expression",
+  );
+});
+
+it.each([
+  'fileURLToPath("file:///app/%2Fpreload.js")',
+  'fileURLToPath("file:///app/%5Cpreload.js")',
+  'fileURLToPath("file:///app/%")',
+  'fileURLToPath("file:///C:/app/preload.js")',
+  'fileURLToPath("file://remote/share/preload.js")',
+  'fileURLToPath("file:///app/preload.js", options)',
+  "fileURLToPath(selectedUrl)",
+])("leaves platform-dependent or invalid %s unknown", (expression) =>
+  expect(
+    staticPath(parseExpression(expression, { sourceType: "module" })),
+  ).toBeUndefined(),
+);
 
 const analyzePathConsumers = (expression: string) => {
   const property = `preload: ${expression}`;

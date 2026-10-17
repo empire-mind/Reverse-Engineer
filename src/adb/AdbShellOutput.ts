@@ -172,7 +172,7 @@ export const parseWmDensityOutput = (
   return { physical, override };
 };
 
-/** Parse the focus declarations from `dumpsys window windows`. */
+/** Parse focus declarations from `dumpsys window windows` or `displays`. */
 export const parseWindowFocusOutput = (
   stdout: string,
 ): {
@@ -236,7 +236,11 @@ export const parseDumpsysPackageOutput = (
       inPermissions = true;
       continue;
     }
-    if (inPermissions && /^\s{2,}[A-Za-z0-9._]+$/.test(line)) {
+    // Android 10 and 11 mark restricted entries as "NAME: restricted=true".
+    if (
+      inPermissions &&
+      /^\s{2,}[A-Za-z0-9._]+(?:: restricted=true)?$/u.test(line)
+    ) {
       permissions += 1;
       continue;
     }
@@ -289,6 +293,10 @@ export const parseBugreportCopiedPath = (stdout: string): string | null => {
   return match === null ? null : match[1]!;
 };
 
+/** Read the device's `Failure [REASON]` verdict from package-change output. */
+export const packageChangeFailureReason = (output: string): string | null =>
+  /Failure \[([^\]]+)\]/u.exec(output)?.[1] ?? null;
+
 /**
  * Parse `adb install`/`adb uninstall` output. adb can print `Failure [...]`
  * with a zero exit code, so the text decides, not the exit status.
@@ -301,10 +309,11 @@ export const parsePackageChangeOutput = (
 } => {
   const text = stdout.trim();
   if (/^Success$/mu.test(text)) return { status: "success", reason: null };
-  const failure = /Failure \[([^\]]+)\]/u.exec(text);
   return {
     status: "failure",
-    reason: failure?.[1] ?? (text === "" ? null : text.slice(0, 512)),
+    reason:
+      packageChangeFailureReason(text) ??
+      (text === "" ? null : text.slice(0, 512)),
   };
 };
 
@@ -320,32 +329,80 @@ export const parseResolveActivityOutput = (stdout: string): string | null => {
   return lines.length === 0 ? null : lines[lines.length - 1]!;
 };
 
+/** Parsed facts and verdict from the full `am start -W` report. */
+export interface AmStartOutput {
+  readonly status: "started" | "refused";
+  readonly startedActivity: string | null;
+  readonly activity: string | null;
+  readonly reportedStatus: string | null;
+  readonly reason: string | null;
+}
+
 /**
- * Parse `am start` output. Success prints `Starting: Intent { ... }`;
- * refusals print lines starting with `Error:` or `Warning:` and activity
- * classes that do not exist name the component.
+ * Parse the complete `am start -W` report. `Starting:` records an attempt;
+ * hard errors and any non-ok Activity Manager status determine the verdict.
  */
 export const parseAmStartOutput = (
   stdout: string,
-): {
-  readonly status: "started" | "refused";
-  readonly startedActivity: string | null;
-  readonly reason: string | null;
-} => {
-  const text = stdout.trim();
-  const starting = /^Starting:\s+Intent\s*\{(.*)\}\s*$/mu.exec(text);
-  if (starting !== null)
+  stderr = "",
+): AmStartOutput => {
+  const normalizedStdout = stdout.replaceAll("\r\n", "\n");
+  const starting = /^Starting:[ \t]+Intent[ \t]*\{(.*)\}[ \t]*$/mu.exec(
+    normalizedStdout,
+  );
+  const startedActivity = starting?.[1]?.trim() ?? null;
+  const activityMatch = /^Activity:[ \t]*(.*)$/mu.exec(normalizedStdout);
+  const activity = activityMatch?.[1]?.trim() || null;
+  const statuses = [...normalizedStdout.matchAll(/^Status:[ \t]*(.*)$/gmu)].map(
+    (match) => match[1]!.trim(),
+  );
+  const nonOkStatus = statuses.find((status) => status.toLowerCase() !== "ok");
+  const reportedStatus = nonOkStatus ?? statuses[0] ?? null;
+  const error = [normalizedStdout, stderr.replaceAll("\r\n", "\n")]
+    .flatMap((stream) => stream.split("\n"))
+    .map((line) => line.trim())
+    .map((line) => ({
+      line,
+      match: /^(?:Error|Exception)(?::|\b)(.*)$/iu.exec(line),
+    }))
+    .find(({ match }) => match !== null);
+  const errorReason = error?.match?.[1]?.trim() || error?.line || null;
+  const statusReason =
+    nonOkStatus === ""
+      ? "am start reported an empty status"
+      : nonOkStatus === undefined
+        ? null
+        : `am start reported status: ${nonOkStatus}`;
+  const reason =
+    errorReason ??
+    statusReason ??
+    (/^Warning:/mu.test(normalizedStdout.trim())
+      ? normalizedStdout.trim().slice(0, 512)
+      : null);
+  if (errorReason !== null || nonOkStatus !== undefined)
+    return {
+      status: "refused",
+      startedActivity,
+      activity,
+      reportedStatus,
+      reason: reason ?? "am start did not report a successful launch",
+    };
+  if (startedActivity !== null)
     return {
       status: "started",
-      startedActivity: starting[1]!.trim(),
+      startedActivity,
+      activity,
+      reportedStatus,
       reason: null,
     };
-  const error = /^(?:Error|Warning|Exception)(?::|\b)(.*)$/mu.exec(text);
+  const text = `${normalizedStdout}\n${stderr.replaceAll("\r\n", "\n")}`.trim();
   return {
     status: "refused",
-    startedActivity: null,
+    startedActivity,
+    activity,
+    reportedStatus,
     reason:
-      error?.[1]?.trim() ??
+      reason ??
       (text === "" ? "am start returned no activity" : text.slice(0, 512)),
   };
 };

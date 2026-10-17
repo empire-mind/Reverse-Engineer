@@ -1,10 +1,14 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
+import {
+  DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS,
+  providerStartupTimeoutSchema,
+} from "../config/providerStartupTimeout.js";
 import { safeParseJson } from "../domain/safeJson.js";
 import { boundedUtf8Text } from "./boundedUtf8Text.js";
 import { execFileOutput, execFileOutputFailure } from "./ExecFileOutput.js";
@@ -73,8 +77,27 @@ const sourceFiles = [
  */
 export const SWIFTC_INTERRUPT = "SIGINT";
 
-/** Deadline for the one-shot helper compilation. */
-const COMPILER_TIMEOUT_MS = 60_000;
+/**
+ * Resolve the Darwin ownership-helper compile deadline from an explicit option
+ * or `REA_SWIFTC_COMPILE_TIMEOUT_MS`. The default matches the measured fresh
+ * Swift SDK cache on the supported Intel macOS VM (about 88s), so compilation
+ * stays bounded independently of short provider version probes. Invalid ambient
+ * values fall back to the default; `parseConfig` still rejects them at CLI/MCP
+ * admission.
+ */
+export const resolveSwiftcCompileTimeoutMs = (
+  options: {
+    readonly compileTimeoutMs?: number;
+    readonly environment?: Readonly<Record<string, string | undefined>>;
+  } = {},
+): number => {
+  if (options.compileTimeoutMs !== undefined) return options.compileTimeoutMs;
+  const raw = (options.environment ?? process.env)
+    .REA_SWIFTC_COMPILE_TIMEOUT_MS;
+  if (raw === undefined) return DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS;
+  const parsed = providerStartupTimeoutSchema.safeParse(raw);
+  return parsed.success ? parsed.data : DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS;
+};
 
 /** Bound on compiler diagnostics embedded in the inspection failure text. */
 const STDERR_EXCERPT_LIMIT = 512;
@@ -163,14 +186,19 @@ const compilerOutcomeDescription = (
 const compilerInspectionError = (
   cause: unknown,
   timeoutMs: number,
+  compiler: DarwinProcessReaderCompiler,
 ): DarwinProcessOwnershipInspectionError => {
   const outcome = compilerOutcome(cause, timeoutMs);
   const code = outcome?.code ?? "unknown";
   const description = compilerOutcomeDescription(outcome, code);
+  const launcher =
+    compiler.kind === "xcrun"
+      ? "xcrun"
+      : "the selected Swift compiler (REA_DARWIN_SWIFTC_PATH)";
   const prefix =
     code === "ENOENT"
-      ? "macOS process ownership inspection requires the Apple Swift compiler via xcrun"
-      : "macOS process ownership helper compilation failed via xcrun";
+      ? `macOS process ownership inspection requires the Apple Swift compiler via ${launcher}`
+      : `macOS process ownership helper compilation failed via ${launcher}`;
   const stderr = boundedUtf8Text(outcome?.stderr ?? "", STDERR_EXCERPT_LIMIT);
   const diagnostics = stderr.text.trim();
   const truncated =
@@ -235,15 +263,37 @@ const waitForCompilation = async (
   });
 };
 
+/** Explicit tool selection; direct Swift compilation also needs its matching SDK. */
+export type DarwinProcessReaderCompiler =
+  | { readonly kind: "xcrun"; readonly executable: string }
+  | {
+      readonly kind: "swiftc";
+      readonly executable: string;
+      readonly sdkRoot: string;
+    };
+
 /** Compile and retain the narrow Darwin sysctl reader for this REA process. */
 export const createDarwinProcessRunTokenReader = (
   options: {
-    readonly xcrun?: string;
-    /** Deadline for the helper compilation; the default keeps verification fast. */
+    readonly compiler?: DarwinProcessReaderCompiler;
+    /** Deadline for helper compilation, independent of provider execution. */
     readonly compileTimeoutMs?: number;
+    /** Environment consulted when `compileTimeoutMs` is omitted. */
+    readonly environment?: Readonly<Record<string, string | undefined>>;
+    /**
+     * Caller-owned directory holding the compiler's module cache. Unset keeps
+     * Swift's reusable default cache; a supplied directory outlives this
+     * reader because cleanup only removes the per-run helper root.
+     */
+    readonly moduleCachePath?: string;
   } = {},
 ) => {
-  const compilerTimeoutMs = options.compileTimeoutMs ?? COMPILER_TIMEOUT_MS;
+  const compiler = options.compiler ?? {
+    kind: "xcrun",
+    executable: "/usr/bin/xcrun",
+  };
+  const compilerTimeoutMs = resolveSwiftcCompileTimeoutMs(options);
+  const moduleCachePath = options.moduleCachePath ?? "";
   let root: string | undefined;
   let executable: string | undefined;
   let compilation: ProcessReaderCompilation | undefined;
@@ -266,6 +316,14 @@ export const createDarwinProcessRunTokenReader = (
   const runCompilation = async (signal: AbortSignal): Promise<string> => {
     let operationRoot: string | undefined;
     try {
+      if (
+        compiler.kind === "swiftc" &&
+        (!isAbsolute(compiler.executable) || !isAbsolute(compiler.sdkRoot))
+      ) {
+        throw new DarwinProcessOwnershipInspectionError(
+          "Direct Darwin helper compilation requires absolute REA_DARWIN_SWIFTC_PATH and SDKROOT paths selecting a compatible installed Swift compiler and macOS SDK.",
+        );
+      }
       operationRoot = await mkdtemp(join(tmpdir(), "rea-process-token-"));
       root = operationRoot;
       process.once("exit", cleanupAtExit);
@@ -280,23 +338,30 @@ export const createDarwinProcessRunTokenReader = (
         ...process.env,
         TMPDIR: compilerTemporary,
       };
-      // Use Swift's reusable default cache for REA's internal helper compilation.
-      delete compilerEnvironment.CLANG_MODULE_CACHE_PATH;
+      const compilerArguments =
+        compiler.kind === "xcrun" ? ["swiftc"] : ["-sdk", compiler.sdkRoot];
+      if (compiler.kind === "swiftc")
+        compilerEnvironment.SDKROOT = compiler.sdkRoot;
+      if (moduleCachePath === "") {
+        // Use Swift's reusable default cache for REA's internal helper compilation.
+        delete compilerEnvironment.CLANG_MODULE_CACHE_PATH;
+      } else {
+        await mkdir(moduleCachePath, { recursive: true });
+        compilerArguments.push("-module-cache-path", moduleCachePath);
+        compilerEnvironment.CLANG_MODULE_CACHE_PATH = moduleCachePath;
+      }
+      compilerArguments.push(...sourceFiles, "-o", output);
       try {
-        await execFileOutput(
-          options.xcrun ?? "/usr/bin/xcrun",
-          ["swiftc", ...sourceFiles, "-o", output],
-          {
-            timeout: compilerTimeoutMs,
-            maxBuffer: 1024 * 1024,
-            signal,
-            stopSignal: SWIFTC_INTERRUPT,
-            env: compilerEnvironment,
-          },
-        );
+        await execFileOutput(compiler.executable, compilerArguments, {
+          timeout: compilerTimeoutMs,
+          maxBuffer: 1024 * 1024,
+          signal,
+          stopSignal: SWIFTC_INTERRUPT,
+          env: compilerEnvironment,
+        });
       } catch (cause: unknown) {
         if (isExpectedAbort(cause, signal)) throw cause;
-        throw compilerInspectionError(cause, compilerTimeoutMs);
+        throw compilerInspectionError(cause, compilerTimeoutMs, compiler);
       }
       if (signal.aborted || closed) throw abortReason(signal);
       executable = output;

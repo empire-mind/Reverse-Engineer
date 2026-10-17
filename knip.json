@@ -7,8 +7,10 @@
     "src/contracts/errorSchemas.ts",
     "src/evaluation/AgentEvaluationFixtures.ts",
     "src/application/RealHopperAssertions.ts",
+    "scripts/verify/fridaBindingsCompatibility.ts",
     "scripts/verify/termux/browser.mjs",
     "scripts/verify-real-ghidra-noreturn.mjs",
+    "scripts/run-exact-tests.mjs",
     "tests/processOwnershipRunner.ts"
   ],
   "project": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.mjs"],
@@ -16,7 +18,12 @@
     "entry": ["docs/.vitepress/config.ts"]
   },
   "ignoreBinaries": ["mkfifo"],
-  "ignoreDependencies": ["electron", "esbuild", "webpack"],
+  "ignoreDependencies": [
+    "@stryker-mutator/command-runner",
+    "electron",
+    "esbuild",
+    "webpack"
+  ],
   "ignoreExportsUsedInFile": true,
   "rules": {
     "files": "error",

@@ -19,6 +19,33 @@ const TARGET: BinaryTarget = {
 const PROVIDER = { id: "fixture", name: "Fixture provider", version: "1" };
 const PROFILE = createAnalysisProfile(PROVIDER, { loader: "default" });
 
+it("rejects a detected Evidence subject with the raw-only 6502 architecture", () => {
+  const selected = {
+    path: TARGET.path,
+    sha256: TARGET.sha256,
+    format: "raw-binary" as const,
+    architecture: "6502" as const,
+  };
+  expect(
+    createEvidence(selected, PROVIDER, {
+      operation: "inspect",
+      parameters: {},
+      result: null,
+    }).subject,
+  ).toMatchObject({ format: "raw-binary", architecture: "6502" });
+  const malformed = {
+    ...selected,
+    format: "pe" as const,
+  };
+  expect(() =>
+    createEvidence(malformed, PROVIDER, {
+      operation: "inspect",
+      parameters: {},
+      result: null,
+    }),
+  ).toThrow();
+});
+
 it("preserves omitted relationship diagnostics and authenticates reported diagnostics", () => {
   const observation = {
     operation: "procedure_callees",
@@ -50,6 +77,30 @@ it("preserves omitted relationship diagnostics and authenticates reported diagno
       relationship_coverage: diagnosed.relationship_coverage,
     }),
   ).toThrow("semantic identifier");
+});
+
+it("projects known provider fields and preserves open JSON payloads", () => {
+  const liveProvider = { ...PROVIDER, transient_status: "starting" };
+  const evidence = createEvidence(TARGET, liveProvider, {
+    operation: "inspect",
+    parameters: { caller_metadata: { note: "kept" } },
+    result: { producer_extension: { value: "kept" } },
+    analysisProfile: PROFILE,
+    environment: {
+      id: "fixture",
+      platform: "linux",
+      architecture: "x86_64",
+      isolation: "process",
+    },
+    locations: [{ kind: "address", address: "0x1000" }],
+  });
+
+  expect(evidence.provider).toEqual(PROVIDER);
+  expect(evidence.parameters).toEqual({ caller_metadata: { note: "kept" } });
+  expect(evidence.normalized_result).toEqual({
+    producer_extension: { value: "kept" },
+  });
+  expect(parseEvidence(evidence)).toEqual(evidence);
 });
 
 it("preserves identity and bytes when reusing an owned immutable result", () => {
@@ -415,6 +466,62 @@ describe("DOS analysis evidence identity", () => {
   });
 });
 
+describe("evidence JSON admission before authentication", () => {
+  it.each(["parameters", "raw_result", "normalized_result"] as const)(
+    "keeps rejected accessors and proxies inert in %s",
+    (field) => {
+      const evidence = createEvidence(TARGET, PROVIDER, {
+        operation: "health",
+        parameters: {},
+        result: true,
+      });
+      for (const kind of ["accessor", "proxy"] as const) {
+        let reads = 0;
+        const value =
+          kind === "accessor"
+            ? {
+                get attack() {
+                  reads += 1;
+                  return "observed";
+                },
+              }
+            : new Proxy(
+                { attack: "observed" },
+                {
+                  ownKeys(target) {
+                    reads += 1;
+                    return Reflect.ownKeys(target);
+                  },
+                  get(target, key, receiver) {
+                    reads += 1;
+                    return Reflect.get(target, key, receiver);
+                  },
+                },
+              );
+        let failure: unknown;
+        try {
+          parseEvidence({ ...evidence, [field]: value });
+        } catch (cause: unknown) {
+          failure = cause;
+        }
+        expect(reads, `${kind} reached Evidence authentication`).toBe(0);
+        expect(failure).toMatchObject({
+          name: "ZodError",
+          issues: [
+            {
+              code: "custom",
+              path: [field],
+              message: expect.stringContaining(
+                kind === "accessor" ? "accessors" : "proxies",
+              ),
+            },
+          ],
+        });
+      }
+    },
+  );
+});
+
 describe("evidence parameter depth bound", () => {
   it("rejects evidence whose parameters nest past the JSON depth limit", () => {
     const evidence = createEvidence(TARGET, PROVIDER, {
@@ -436,6 +543,20 @@ describe("evidence parameter depth bound", () => {
         issue.message.includes("maximum nesting depth"),
       ),
     ).toBe(true);
+  });
+
+  it("stops semantic authentication when normalized JSON exceeds its depth bound", () => {
+    const evidence = createEvidence(TARGET, PROVIDER, {
+      operation: "health",
+      parameters: {},
+      result: true,
+    });
+    let value: unknown = 1;
+    for (let index = 0; index < 10_000; index += 1) value = { nested: value };
+
+    expect(() =>
+      parseEvidence({ ...evidence, normalized_result: value }),
+    ).toThrow(/maximum nesting depth/u);
   });
 });
 

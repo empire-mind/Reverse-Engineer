@@ -32,18 +32,21 @@ const methods = [
   {
     name: "onCreate",
     signature: "onCreate(Bundle): void",
+    dex_descriptor: "(Landroid/os/Bundle;)V",
     is_constructor: false,
     def_pos: 0,
   },
   {
     name: "choose",
     signature: "choose(String): void",
+    dex_descriptor: "(Ljava/lang/String;)V",
     is_constructor: false,
     def_pos: 0,
   },
   {
     name: "choose",
     signature: "choose(int): void",
+    dex_descriptor: "(I)V",
     is_constructor: false,
     def_pos: 0,
   },
@@ -139,10 +142,18 @@ register("get_method_body", ({ method_name, overload_index }) =>
   }),
 );
 for (const name of ["get_xrefs_to_class", "get_xrefs_to_method"])
-  register(name, ({ class_name, method_name }) =>
+  register(name, ({ class_name, method_name, overload_index }) =>
     json({
       target:
         method_name === undefined ? class_name : `${class_name}.${method_name}`,
+      ...(method_name === undefined
+        ? {}
+        : {
+            overload_index,
+            reported_signature: methods.filter(
+              (method) => method.name === method_name,
+            )[overload_index]?.signature,
+          }),
       total: mode === "partial-xrefs" ? 2 : 1,
       count: 1,
       resolve_line: false,
@@ -159,3 +170,6 @@ for (const name of ["get_xrefs_to_class", "get_xrefs_to_method"])
     }),
   );
 await server.connect(new StdioServerTransport());
+// A refused cleanup must leave a live process for verified fixture teardown.
+// Otherwise stdin EOF races the ownership scan with the server's natural exit.
+if (mode === "cleanup-failure") setInterval(() => {}, 1000);

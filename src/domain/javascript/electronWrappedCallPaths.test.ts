@@ -140,6 +140,102 @@ it("preserves an observed empty contextBridge API object", () => {
   expect(result.parse_status).toBe("complete");
 });
 
+it.each([
+  [
+    "explicit nested paths after an unknown spread",
+    `{ ...extra, a: { b: 1 }, c: 2 }`,
+    ["a", "a.b", "c"],
+    1,
+    "dynamic",
+  ],
+  [
+    "a direct object literal",
+    `{ a: { b: 1 }, c: 2 }`,
+    ["a", "a.b", "c"],
+    0,
+    "object-literal",
+  ],
+  ["a dynamic API argument", "getApi()", [], 1, "dynamic"],
+] as const)(
+  "preserves directly observed nested bridge members for %s",
+  (_name, api, members, unknownMembers, apiStatus) => {
+    const result = analyzeJavaScriptStaticSource(`
+      const { contextBridge } = require("electron");
+      contextBridge.exposeInMainWorld("api", ${api});
+    `);
+    expect(result.electron.context_bridge_apis).toContainEqual(
+      expect.objectContaining({
+        api_key: "api",
+        api_status: apiStatus,
+        members,
+        unknown_members: unknownMembers,
+      }),
+    );
+  },
+);
+
+describe("wrapped contextBridge exposure methods", () => {
+  it("retains the original expression for a dynamic isolated world id", () => {
+    const result = analyzeJavaScriptStaticSource(
+      bundle(
+        `const worldId = selectWorld(); electron.contextBridge.exposeInIsolatedWorld(worldId, "isolatedApi", {ping: true});`,
+      ),
+    );
+    // The proven Webpack bootstrap resolves `load(2)` directly, so the complete
+    // direct observation is retained instead of a wrapper substitution.
+    expect(result.electron.context_bridge_apis).toEqual([
+      expect.objectContaining({
+        world: "isolated",
+        world_id: {
+          status: "dynamic",
+          value: null,
+          expression: "worldId",
+        },
+        api_key: "isolatedApi",
+        api_status: "object-literal",
+        members: ["ping"],
+        unknown_members: 0,
+        module_key: "9",
+        module_runtime: "webpack-bootstrap@0",
+      }),
+    ]);
+    expect(result.electron.context_bridge_apis[0]).not.toHaveProperty(
+      "resolution_basis",
+    );
+    expect(result.parse_status).toBe("partial");
+  });
+
+  it("does not report a conditionally selected world as unconditional", () => {
+    const result = analyzeJavaScriptStaticSource(
+      bundle(
+        `if (useIsolated) electron.contextBridge.exposeInIsolatedWorld(1001, "isolatedApi", {ping: true});`,
+      ),
+    );
+    expect(result.electron.context_bridge_apis).not.toContainEqual(
+      expect.objectContaining({
+        api_key: "isolatedApi",
+        resolution_basis: "wrapper-substitution",
+      }),
+    );
+    expect(result.parse_status).toBe("partial");
+  });
+
+  it("does not report conditionally resolved world ids as unconditional", () => {
+    const result = analyzeJavaScriptStaticSource(
+      bundle(
+        `const worldId = useFirstWorld ? 1001 : 1002; electron.contextBridge.exposeInIsolatedWorld(worldId, "isolatedApi", {ping: true});`,
+      ),
+    );
+    expect(result.electron.context_bridge_apis).not.toContainEqual(
+      expect.objectContaining({
+        api_key: "isolatedApi",
+        resolution_basis: "wrapper-substitution",
+      }),
+    );
+    expect(result.parse_status).toBe("partial");
+  });
+});
+
 it("connects exposed closures to IPC sends and text clipboard calls", () => {
   const result = analyzeJavaScriptStaticSource(
     bundle(`
@@ -302,6 +398,83 @@ it("preserves guarded alternatives in direct exposed object literals", () => {
       }),
     ]),
   );
+});
+it("preserves bridge member segments and excludes prototype setters", () => {
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    const write=()=>e.ipcRenderer.send("write");
+    e.contextBridge.exposeInMainWorld("desktop", {
+      "nested.write": write,
+      nested: { write },
+      __proto__: { inherited: write },
+      ["__proto__"]: { own: write },
+    });
+  `);
+  expect(result.electron.call_paths).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry: "desktop.nested.write",
+        entry_path: ["desktop", "nested.write"],
+      }),
+      expect.objectContaining({
+        entry: "desktop.nested.write",
+        entry_path: ["desktop", "nested", "write"],
+      }),
+      expect.objectContaining({
+        entry: "desktop.__proto__.own",
+        entry_path: ["desktop", "__proto__", "own"],
+      }),
+    ]),
+  );
+  expect(result.electron.call_paths).not.toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry_path: ["desktop", "__proto__", "inherited"],
+      }),
+    ]),
+  );
+});
+it("follows an explicit object-literal prototype lookup in a bridge wrapper", () => {
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    const prototype={send:()=>e.ipcRenderer.send("through-prototype")};
+    const object={__proto__:prototype};
+    e.contextBridge.exposeInMainWorld("desktop", {
+      action:()=>object.__proto__.send(),
+    });
+  `);
+  expect(result.electron.call_paths).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry_path: ["desktop", "action"],
+        channel: "through-prototype",
+      }),
+    ]),
+  );
+});
+it("does not spread a large nested bridge member list into function arguments", () => {
+  const members = Array.from(
+    { length: 125_000 },
+    (_, index) => `m${index}(){}`,
+  ).join(",");
+  const source = `const e=require("electron");e.contextBridge.exposeInMainWorld("desktop",{nested:{${members}}});`;
+  expect(() => analyzeJavaScriptStaticSource(source)).not.toThrow();
+});
+it("reports nested bridge depth truncation while retaining shallow paths", () => {
+  const nested =
+    Array.from({ length: 130 }, (_, index) => `level${index}:{`).join("") +
+    `deep:()=>e.ipcRenderer.send("deep")` +
+    "}".repeat(130);
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    e.contextBridge.exposeInMainWorld("desktop", {
+      shallow:()=>e.ipcRenderer.send("shallow"), ${nested}
+    });
+  `);
+  expect(result.electron.call_paths).toContainEqual(
+    expect.objectContaining({ entry: "desktop.shallow", channel: "shallow" }),
+  );
+  expect(result.limitations.join(" ")).toContain("depth 128");
 });
 it("preserves conditions when a wrapper dispatches through conditional external methods", () => {
   const result = analyzeJavaScriptStaticSource(`

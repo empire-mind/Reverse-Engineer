@@ -25,6 +25,43 @@ import { semanticCoverageResourceLimits } from "../../domain/javascript/javascri
 
 const SHA256 = "a".repeat(64);
 
+it.each([
+  ["plain export", "const answer = 42; export { answer };", 0],
+  ["aliased export", "const answer = 42; export { answer as result };", 0],
+  ["declaration only", "const answer = 42;", 0],
+  ["genuine assignment", "let answer = 0; answer = 1;", 1],
+])(
+  "projects writes only for actual writes: %s",
+  (_name, source, writeCount) => {
+    const graph = graphFor(source);
+    const binding = graph.nodes.find(
+      ({ kind, label }) => kind === "binding" && label === "answer",
+    );
+    if (binding === undefined) throw new Error("Expected answer binding");
+    const writes = graph.relations.filter(
+      ({ relation, target_node_id }) =>
+        relation === "writes" && target_node_id === binding.node_id,
+    );
+    expect(writes).toHaveLength(writeCount);
+    const exportReference = graph.nodes.find(
+      ({ identity }) => identity.role_key === "reference:0:export:answer",
+    );
+    if (source.includes("export {")) expect(exportReference).toBeDefined();
+
+    const trace = queryJavaScriptSemanticGraph(graph, {
+      seed: { kind: "semantic-node", node_id: binding.node_id },
+      direction: "backward-provenance",
+      allowed_relations: ["writes"],
+    });
+    expect(trace.status).toBe("found");
+    expect(trace.summary).toMatchObject({
+      total_seed_matches: 1,
+      traversed_relations: writeCount,
+    });
+    expect(trace.relations).toHaveLength(writeCount);
+  },
+);
+
 it("projects closure and direct interprocedural flow without execution", () => {
   const graph = graphFor(`
       const outer = 2;
@@ -62,6 +99,44 @@ it("projects closure and direct interprocedural flow without execution", () => {
       "defines",
       "reads",
     ]),
+  );
+});
+
+it.each([
+  ["direct assignment", "source.count = 2;"],
+  ["destructuring assignment", "[source.count] = [2];"],
+  ["for-of head", "for (source.count of [4]) {}"],
+  ["for-in head", "for (source.count in { key: true }) {}"],
+  ["delete", "delete source.count;"],
+])("projects a %s member target as a property write", (_name, statement) => {
+  const graph = graphFor(`const source = { count: 1 }; ${statement}`);
+  const operations = graph.nodes.filter(
+    ({ properties }) => properties.operation_kind !== undefined,
+  );
+  expect(operations.map(({ label }) => label)).toEqual(["write:/count"]);
+  const write = operations[0];
+  if (write === undefined) throw new Error("Expected write operation node");
+  expect(graph.relations).toContainEqual(
+    expect.objectContaining({
+      source_node_id: write.node_id,
+      relation: "writes-property",
+    }),
+  );
+  expect(graph.relations).not.toContainEqual(
+    expect.objectContaining({
+      source_node_id: write.node_id,
+      relation: "reads-property",
+    }),
+  );
+});
+
+it("continues to project an ordinary member access as a property read", () => {
+  const graph = graphFor(`
+    const source = { count: 1 };
+    const value = source.count;
+  `);
+  expect(graph.relations).toContainEqual(
+    expect.objectContaining({ relation: "reads-property" }),
   );
 });
 
