@@ -1,0 +1,30 @@
+name: rea-workbench
+
+services:
+  rea:
+    image: rea-workbench:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["status"]
+    user: "1000:1000"
+    init: true
+    stdin_open: true
+    tty: false
+    read_only: true
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=1g,mode=1777
+    environment:
+      REA_WORKBENCH_MEMORY: /evidence
+    volumes:
+      - rea_evidence:/evidence
+
+volumes:
+  rea_evidence:
+    name: ${REA_MEMORY_VOLUME:-rea-workbench-evidence}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "rea-workbench": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/bin/workbench-mcp.mjs",
+        "--memory",
+        "${PLUGIN_DATA}/memory"
+      ],
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}

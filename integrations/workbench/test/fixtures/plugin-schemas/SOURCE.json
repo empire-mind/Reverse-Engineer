@@ -1,0 +1,20 @@
+{
+  "project": "Agent Plugins",
+  "specification": "1.0.0",
+  "retrieved_at": "2026-10-17",
+  "license": "Apache-2.0",
+  "licensing_source": "https://github.com/agentplugins/agent-plugins-spec/blob/main/LICENSE.md",
+  "modifications": "None. Canonical published JSON schema bytes are preserved.",
+  "files": [
+    {
+      "path": "plugin.schema.json",
+      "source": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+      "sha256": "0a4aad95ce337878ad38802ebf0daa3fde76abe3f65400c86bcbb1ec0b3ab883"
+    },
+    {
+      "path": "mcp.schema.json",
+      "source": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      "sha256": "6539175bfcdf43085855183e86da40ea94b166547a72b47ae9a0a390516d3acb"
+    }
+  ]
+}

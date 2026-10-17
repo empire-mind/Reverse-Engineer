@@ -6,25 +6,30 @@ on:
       - "integrations/workbench/**"
       - ".github/workflows/rea-workbench.yml"
       - ".gitignore"
+      - ".agents/plugins/marketplace.json"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  REA_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
   workbench:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: integrations/workbench
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: "24.18.0"
+          node-version: "24.22.0"
           cache: npm
           cache-dependency-path: integrations/workbench/package-lock.json
       - name: Use repository npm version
@@ -33,7 +38,82 @@ jobs:
         run: npm ci --ignore-scripts --omit=optional --no-fund --no-audit
       - name: Focused checks
         run: npm test
-      - name: Published-package CLI workflows
+      - name: Published-package CLI and workflow MCP journeys
         run: npm run test:integration
+      - name: Audit installed runtime dependency profile
+        run: npm audit --omit=dev --omit=optional --audit-level=moderate
       - name: Inspect private package contents
         run: npm pack --dry-run --ignore-scripts
+      - name: Build a self-contained plugin from a fresh locked install
+        run: npm run package:plugin -- --output "$RUNNER_TEMP/rea-workbench-plugin"
+      - name: Connect both relocated plugin manifests with the actual SDK
+        run: npm run test:plugin -- --directory "$RUNNER_TEMP/rea-workbench-plugin"
+      - name: Archive verified plugin with modes and internal links intact
+        run: |
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/rea-workbench-plugin.tar.gz" rea-workbench-plugin
+          cd "$RUNNER_TEMP"
+          sha256sum rea-workbench-plugin.tar.gz > rea-workbench-plugin.sha256
+      - name: Retain the complete reviewed plugin package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rea-workbench-plugin-${{ env.REA_SOURCE_REVISION }}
+          path: |
+            ${{ runner.temp }}/rea-workbench-plugin.tar.gz
+            ${{ runner.temp }}/rea-workbench-plugin.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 90
+
+  container:
+    name: Container (${{ matrix.architecture }})
+    needs: workbench
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: integrations/workbench
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.0"
+          cache: npm
+          cache-dependency-path: integrations/workbench/package-lock.json
+      - name: Use repository npm version
+        run: npm install --global npm@11.16.0 --ignore-scripts --no-fund --no-audit
+      - name: Install pinned SDK for the actual container client
+        run: npm ci --ignore-scripts --omit=optional --no-fund --no-audit
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build the digest-pinned Linux runtime
+        run: docker build --pull --build-arg VCS_REF="$REA_SOURCE_REVISION" -t rea-workbench:test .
+      - name: Analyze, retain and resume through actual isolated containers
+        run: node scripts/container-smoke.mjs --image rea-workbench:test > "$RUNNER_TEMP/rea-container-smoke.json"
+      - name: Archive the exact tested image
+        run: |
+          docker image save --output "$RUNNER_TEMP/rea-workbench-image.tar" rea-workbench:test
+          gzip -n "$RUNNER_TEMP/rea-workbench-image.tar"
+          cd "$RUNNER_TEMP"
+          sha256sum rea-workbench-image.tar.gz > rea-workbench-image.sha256
+      - name: Retain tested image and platform receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rea-workbench-image-${{ matrix.architecture }}-${{ env.REA_SOURCE_REVISION }}
+          path: |
+            ${{ runner.temp }}/rea-workbench-image.tar.gz
+            ${{ runner.temp }}/rea-workbench-image.sha256
+            ${{ runner.temp }}/rea-container-smoke.json
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 90

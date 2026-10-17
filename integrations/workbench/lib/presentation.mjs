@@ -77,6 +77,8 @@ export function boundResult(
     "total",
     "shown",
     "truncated",
+    "diagnostic_receipt",
+    "completed_analysis_receipt",
   ]);
   const candidates = Object.keys(result)
     .filter((key) => !preserve.has(key))
@@ -183,16 +185,46 @@ export function toolResultValue(response) {
   return JSON.parse(text);
 }
 
+function recoveryFields(error) {
+  return {
+    ...(error.startupDiagnostics !== undefined
+      ? { startup_diagnostics: error.startupDiagnostics }
+      : {}),
+    ...(error.receipt !== undefined
+      ? { diagnostic_receipt: error.receipt }
+      : {}),
+    ...(error.analysisReceipt !== undefined
+      ? { completed_analysis_receipt: error.analysisReceipt }
+      : {}),
+    ...(error.retained !== undefined ? { retained: error.retained } : {}),
+    ...(error.retentionError !== undefined
+      ? { retention_error: error.retentionError }
+      : {}),
+    ...(error.pendingEvidencePath !== undefined
+      ? { pending_evidence_path: error.pendingEvidencePath }
+      : {}),
+    ...(error.cancelled ? { cancelled: true } : {}),
+    ...(error.completedWorkflowStatus !== undefined
+      ? { completed_workflow_status: error.completedWorkflowStatus }
+      : {}),
+  };
+}
+
 export function resultError(error) {
-  if (error instanceof AggregateError && error.cause) {
+  if (error === null || typeof error !== "object")
+    error = new Error(String(error));
+  if (error instanceof AggregateError && (error.cause || error.errors.length)) {
+    const primary = error.cause ?? error.errors[0];
+    const projected = resultError(primary);
     return {
-      ...resultError(error.cause),
-      cleanup_errors: error.errors
-        .filter((item) => item !== error.cause)
-        .map((item) => ({
-          code: item.code ?? null,
-          message: String(item.message).slice(0, 2000),
-        })),
+      ...projected,
+      ...recoveryFields(error),
+      cleanup_errors: [
+        ...(projected.cleanup_errors ?? []),
+        ...error.errors
+          .filter((item) => item !== error.cause)
+          .map((item) => resultError(item)),
+      ],
     };
   }
   let details;
@@ -230,6 +262,7 @@ export function resultError(error) {
     retained: error.retained ?? null,
     retention_error: error.retentionError ?? null,
     pending_evidence_path: error.pendingEvidencePath ?? null,
+    ...recoveryFields(error),
     provenance: UNTRUSTED,
   };
 }

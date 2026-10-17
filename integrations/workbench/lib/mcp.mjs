@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
+import { WORKBENCH_VERSION } from "./runtime.mjs";
 
 const require = createRequire(import.meta.url);
 const AVAILABILITY_REASONS = [
@@ -182,12 +183,36 @@ export class ReaClient {
     return [...this.#successfulTools].sort();
   }
   get diagnostics() {
+    return this.#diagnostics();
+  }
+
+  #diagnostics({
+    stderrLimit = this.#maxStderrBytes,
+    errorLimit = 16,
+    messageLimit = 2048,
+  } = {}) {
+    const stderr = this.#stderr.subarray(
+      Math.max(0, this.#stderr.length - stderrLimit),
+    );
+    const errors = this.#errors.slice(-errorLimit).map((error) => {
+      const message = error.message.slice(0, messageLimit);
+      return {
+        ...error,
+        message,
+        messageCharactersOmitted:
+          error.messageCharactersObserved - message.length,
+      };
+    });
     return {
-      stderrTail: this.#stderr.toString("utf8"),
+      stderrTail: stderr.toString("utf8"),
+      // These counts describe raw stderr bytes, before UTF-8 decoding.
       stderrBytesObserved: this.#stderrBytes,
-      stderrTruncated: this.#stderrBytes > this.#stderr.length,
-      errors: this.#errors.map((error) => ({ ...error })),
+      stderrBytesRetained: stderr.length,
+      stderrBytesOmitted: this.#stderrBytes - stderr.length,
+      stderrTruncated: this.#stderrBytes > stderr.length,
+      errors,
       errorCount: this.#errorCount,
+      errorsOmitted: this.#errorCount - errors.length,
       limits: {
         timeoutMs: this.#timeoutMs,
         maxMessageBytes: this.#maxMessageBytes,
@@ -197,13 +222,15 @@ export class ReaClient {
     };
   }
 
-  #requestOptions() {
+  #requestOptions({ signal } = {}) {
     return {
       timeout: this.#timeoutMs,
       maxTotalTimeout: this.#timeoutMs,
       resetTimeoutOnProgress: false,
       // One deadline also bounds a multi-page discovery walk as a whole.
-      signal: AbortSignal.timeout(this.#timeoutMs),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(this.#timeoutMs)])
+        : AbortSignal.timeout(this.#timeoutMs),
     };
   }
 
@@ -216,7 +243,8 @@ export class ReaClient {
     }
   }
 
-  async connect() {
+  async connect(options = {}) {
+    options.signal?.throwIfAborted();
     if (this.#state === "connected") return this;
     if (this.#state === "connecting") return this.#connectPromise;
     if (this.#state !== "new") {
@@ -226,13 +254,13 @@ export class ReaClient {
       );
     }
     this.#state = "connecting";
-    this.#connectPromise = this.#start();
+    this.#connectPromise = this.#start(options);
     return this.#connectPromise;
   }
 
-  async #start() {
+  async #start(options) {
     this.#sdk = new Client(
-      { name: "rea-workbench", version: "0.1.0" },
+      { name: "rea-workbench", version: WORKBENCH_VERSION },
       {
         capabilities: {},
         enforceStrictCapabilities: true,
@@ -244,10 +272,12 @@ export class ReaClient {
       },
     );
     this.#sdk.onerror = (error) => {
+      const message = String(error?.message ?? error);
       this.#errorCount += 1;
       this.#errors.push({
         name: error?.name ?? "Error",
-        message: String(error?.message ?? error).slice(0, 2048),
+        message: message.slice(0, 2048),
+        messageCharactersObserved: message.length,
       });
       if (this.#errors.length > 16) this.#errors.shift();
     };
@@ -276,7 +306,7 @@ export class ReaClient {
       }
     });
     try {
-      await this.#sdk.connect(this.#transport, this.#requestOptions());
+      await this.#sdk.connect(this.#transport, this.#requestOptions(options));
       this.#serverInfo = this.#sdk.getServerVersion();
       if (
         this.#serverInfo?.name !== "rea" ||
@@ -298,7 +328,7 @@ export class ReaClient {
           "REA_CLIENT_CLOSED",
           "REA connection was closed during initialization.",
         );
-      await this.#discoverTools();
+      await this.#discoverTools(options);
       if (this.#state !== "connecting")
         throw new ReaClientError(
           "REA_CLIENT_CLOSED",
@@ -306,25 +336,38 @@ export class ReaClient {
         );
       this.#state = "connected";
       return this;
-    } catch (error) {
+    } catch (caught) {
+      const error =
+        caught !== null && typeof caught === "object"
+          ? caught
+          : new Error(String(caught), { cause: caught });
+      let failure = error;
       try {
         await this.close();
       } catch (cleanupError) {
-        throw new AggregateError(
+        failure = new AggregateError(
           [error, cleanupError],
           "REA startup and cleanup failed.",
           { cause: error },
         );
       }
-      throw error;
+      // Annotate the original SDK error (or its cleanup aggregate) without
+      // replacing its code/cause or guessing why the child exited. Capture
+      // after owned cleanup so any observed final stderr is included.
+      failure.startupDiagnostics = this.#diagnostics({
+        stderrLimit: 4096,
+        errorLimit: 4,
+        messageLimit: 512,
+      });
+      throw failure;
     }
   }
 
-  async #discoverTools() {
+  async #discoverTools(options) {
     // SDK 2.3.1 walks every page here, caps the walk, validates protocol results,
     // and caches output schemas. An explicit cursor would disable aggregation.
     const result = await this.#sdk.listTools(undefined, {
-      ...this.#requestOptions(),
+      ...this.#requestOptions(options),
       cacheMode: "refresh",
     });
     const definitions = new Map();
@@ -344,13 +387,15 @@ export class ReaClient {
     return result;
   }
 
-  async listTools() {
+  async listTools(options = {}) {
     this.#assertConnected();
-    return this.#discoverTools();
+    options.signal?.throwIfAborted();
+    return this.#discoverTools(options);
   }
 
-  async callTool(name, args = {}) {
+  async callTool(name, args = {}, options = {}) {
     this.#assertConnected();
+    options.signal?.throwIfAborted();
     const definition = this.#definitions.get(name);
     if (definition === undefined) {
       throw new ReaClientError(
@@ -384,7 +429,7 @@ export class ReaClient {
     const result = await this.#sdk.callTool(
       { name, arguments: args },
       {
-        ...this.#requestOptions(),
+        ...this.#requestOptions(options),
         toolDefinition: definition,
       },
     );
@@ -393,23 +438,28 @@ export class ReaClient {
     return result;
   }
 
-  async session() {
-    return this.callTool("binary_session", {
-      expected_package_version: this.#expectedVersion,
-    });
+  async session(options = {}) {
+    return this.callTool(
+      "binary_session",
+      { expected_package_version: this.#expectedVersion },
+      options,
+    );
   }
 
-  async exportBundle(path) {
-    return this.callTool("export_evidence_bundle", {
-      path: absolutePath(path),
-      overwrite: false,
-    });
+  async exportBundle(path, options = {}) {
+    return this.callTool(
+      "export_evidence_bundle",
+      { path: absolutePath(path), overwrite: false },
+      options,
+    );
   }
 
-  async importBundle(path) {
-    return this.callTool("import_evidence_bundle", {
-      path: absolutePath(path),
-    });
+  async importBundle(path, options = {}) {
+    return this.callTool(
+      "import_evidence_bundle",
+      { path: absolutePath(path) },
+      options,
+    );
   }
 
   async close() {

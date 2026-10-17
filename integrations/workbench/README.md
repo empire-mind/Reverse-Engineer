@@ -1,10 +1,24 @@
 # REA investigation workbench
 
 The workbench adds persistent investigation memory, bounded handoffs and repeatable
-CLI workflows around **the published `rea-agents@6.5.0` package**. It uses the
-official MCP client/server SDK at **2.3.1**. Its dependencies are separate from the
+CLI and MCP workflows around **the published `rea-agents@6.5.0` package**. Workbench
+**0.2.0** includes a reusable skill, portable and Claude plugin manifests,
+guarded host adapters, a self-contained package builder, and a Docker runtime.
+It uses the official MCP client/server SDK at **2.3.1**. Its dependencies are separate from the
 REA source tree at the repository root; running this integration does not build or
 upgrade that source tree.
+
+The default is **one workbench MCP server and one private evidence store per
+project on each host**. The skill guides its use; the CLI and MCP share the same
+workflow implementation. Use the container for isolated Linux static analysis,
+and host Node execution when an investigation needs locally installed providers.
+
+| Setup task                                                     | Guide                                                 |
+| -------------------------------------------------------------- | ----------------------------------------------------- |
+| Build, verify and distribute the complete skill/plugin/runtime | [Plugin packaging](docs/plugin.md)                    |
+| Generate or safely apply a supported client's configuration    | [Host adapters and rollback](docs/adapters.md)        |
+| Build and run isolated CLI/MCP workers                         | [Container setup and verification](docs/container.md) |
+| Reuse the investigation procedure                              | [REA Workbench skill](skills/rea-workbench/SKILL.md)  |
 
 Use REA for questions about a selected shipped application, ASAR, package, binary,
 or explicitly chosen runtime. Ordinary source-repository reading remains a normal
@@ -32,7 +46,9 @@ documented prerequisites when a selected investigation requires them.
 | `npm run rea -- --help`                                                 | The published REA CLI and its full native command surface.                                     |
 | `npm run workbench -- COMMAND`                                          | Discovery, selected JavaScript analysis, retained memory and resume workflows described below. |
 | `npm run rea:mcp`                                                       | The published REA MCP server over stdio. This waits for an MCP client.                         |
+| `npm run workbench:mcp -- --memory /absolute/private/rea-memory`        | Default ten-tool workflow and memory MCP server over stdio.                                    |
 | `node bin/memory-mcp.mjs --memory /absolute/project/private/rea-memory` | A separate MCP server exposing saved evidence and analyst notes.                               |
+| `npm run deploy -- --help`                                              | Supported configuration generation, plan/apply and guarded rollback.                           |
 | `lib/mcp.mjs`                                                           | An SDK client for multiple operations within one live REA session.                             |
 
 These entry points use installed dependencies. They do not register a server in
@@ -54,6 +70,13 @@ an advertised or server-reported available tool has not necessarily succeeded on
 your target. Availability distinguishes `available`, `target_required`,
 `provider_missing`, `provider_unavailable`, `unsupported_host` and `unknown`.
 Tool results retain provider remediation and limitations.
+
+If the upstream process closes before the SDK handshake, inspect the returned
+`startup_diagnostics`. It preserves the last 4 KiB of observed stderr, exact byte
+and omission counts, and up to four bounded SDK error summaries. An empty snapshot
+means no diagnostic output was observed; `CONNECTION_CLOSED` alone does not identify
+the cause. Check the selected runtime and executor's supported subprocess setup
+before retrying. No ambient environment values are captured.
 
 `tools --query` searches the returned tool metadata; it does not search an app's
 source. `--available` filters server-reported availability. Tool listings expose
@@ -160,17 +183,42 @@ current working directory. The standalone memory MCP server requires `--memory`
 or `REA_WORKBENCH_MEMORY`. Set `--memory` explicitly when moving between projects so
 every participating CLI or MCP client opens the intended store.
 
-## Expose saved memory through MCP
+## Connect the workflow and memory MCP server
 
 ```bash
-npm run workbench -- config --memory /absolute/project/private/rea-memory
+npm run workbench -- config --profile workflow --memory /absolute/project/private/rea-memory
 ```
 
-`config` prints a generic `mcpServers` object with separate `rea` and `rea_memory`
-stdio launch configurations, using the installed package and absolute paths.
+`config` prints a generic `mcpServers` object using the installed package and
+absolute paths. The default `workflow` profile registers `rea-workbench`.
+`native` registers the upstream `rea` server, `memory` registers `rea-memory`, and
+`all` registers workflow plus native without duplicating the memory tools.
 It does not write client settings or register tools in ChatGPT, Codex, or another
 host. Apply the appropriate configuration using that client's supported setup
-flow, reconnect it, and check its actual tool list.
+flow or the [guarded host adapter](docs/adapters.md), reconnect it, and check its
+actual tool list.
+
+The workflow server adds these five operations to the five memory tools below:
+
+| Tool                        | Purpose                                                                                                      |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `rea_workbench_status`      | Check the live upstream identity, catalog and server-reported availability.                                  |
+| `rea_workbench_tools`       | Discover tools by name/description, with paging and availability filtering.                                  |
+| `rea_workbench_tool_schema` | Retrieve exact named schema text with UTF-8 byte offsets and a full-schema hash.                             |
+| `rea_workbench_analyze_js`  | Analyze an absolute target and a nonempty explicit `source_paths` selection, then retain canonical evidence. |
+| `rea_workbench_resume`      | Verify and import saved evidence in a fresh REA session and return its historical summary.                   |
+
+One expensive workflow runs at a time; another receives `WORKBENCH_BUSY`.
+Memory operations remain usable while that workflow runs. Cancellation reaches
+the upstream SDK. A cancelled operation may not have exported a complete bundle;
+read the returned retention and error facts before assuming evidence was saved.
+The native tool catalog remains available through the separate native server;
+discovery does not invoke a native tool or install its provider.
+
+For schema paging, follow `next_offset` while `has_more` is true and send the
+returned `sha256` as `expected_sha256` on subsequent pages. Join `schema_json`
+pages in order, verify their final SHA-256, then parse the complete JSON. Do not
+dispatch from a partial schema or use catalog position to select a tool.
 
 The memory server exposes exactly these operations:
 

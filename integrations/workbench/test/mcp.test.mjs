@@ -1,4 +1,5 @@
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,6 +11,7 @@ import {
   summarizeCapabilities,
   withRea,
 } from "../lib/mcp.mjs";
+import { resultError } from "../lib/presentation.mjs";
 
 const fixture = fileURLToPath(
   new URL("./fixtures/mcp/server.mjs", import.meta.url),
@@ -147,6 +149,52 @@ test("version mismatch closes the owned child and rejects stale startup", async 
   assert.equal(await readFile(closedPath, "utf8"), "closed\n");
 });
 
+test("pre-handshake exits preserve the SDK failure and bounded observed startup diagnostics", async () => {
+  for (const mode of ["startup-exit", "startup-exit-silent"]) {
+    const client = new ReaClient(options(mode));
+    await assert.rejects(client.connect(), (error) => {
+      assert.equal(error.code, "CONNECTION_CLOSED");
+      assert.equal(error.cause, undefined);
+      const projected = resultError(error);
+      assert.equal(projected.code, error.code);
+      assert.equal(projected.message, error.message);
+      assert.equal(projected.diagnostic, null);
+      assert.deepEqual(projected.startup_diagnostics, error.startupDiagnostics);
+      const snapshot = projected.startup_diagnostics;
+      assert.equal(snapshot.errorCount, client.diagnostics.errorCount);
+      assert.equal(
+        snapshot.errorsOmitted,
+        snapshot.errorCount - snapshot.errors.length,
+      );
+      if (mode === "startup-exit") {
+        const observed = Buffer.byteLength(
+          `${"x".repeat(70_000)}fixture startup failure tail\n`,
+        );
+        assert.equal(snapshot.stderrBytesObserved, observed);
+        assert.equal(snapshot.stderrBytesRetained, 4096);
+        assert.equal(snapshot.stderrBytesOmitted, observed - 4096);
+        assert.equal(snapshot.stderrTruncated, true);
+        assert.equal(Buffer.byteLength(snapshot.stderrTail), 4096);
+        assert.match(snapshot.stderrTail, /fixture startup failure tail\n$/u);
+        assert.equal(client.diagnostics.stderrBytesRetained, 64 * 1024);
+      } else {
+        assert.equal(snapshot.stderrTail, "");
+        assert.equal(snapshot.stderrBytesObserved, 0);
+        assert.equal(snapshot.stderrBytesRetained, 0);
+        assert.equal(snapshot.stderrBytesOmitted, 0);
+        assert.equal(snapshot.stderrTruncated, false);
+        assert.equal(snapshot.errorCount, 0);
+        assert.deepEqual(snapshot.errors, []);
+      }
+      assert(Buffer.byteLength(JSON.stringify(projected)) < 16 * 1024);
+      assert(!("environment" in snapshot));
+      assert(!("exitCode" in snapshot));
+      return true;
+    });
+    assert.equal(client.state, "closed");
+  }
+});
+
 test("callback failures still close the owned process", async (t) => {
   const dir = await directory(t);
   const closedPath = join(dir, "closed.txt");
@@ -217,6 +265,60 @@ test("tool timeout is bounded and cleanup leaves no reusable silent replacement 
     options(undefined, { timeoutMs: 500 }),
   );
   assert.equal(instance.state, "closed");
+});
+
+test("caller cancellation reaches the SDK protocol and cleanup closes only its owned session", async (t) => {
+  const dir = await directory(t);
+  const stalled = join(dir, "stalled.txt");
+  const cancelled = join(dir, "cancelled.json");
+  const closed = join(dir, "closed.txt");
+  const client = new ReaClient({
+    ...options(),
+    launcher: {
+      command: process.execPath,
+      args: [fixture],
+      env: {
+        WORKBENCH_FIXTURE_STALLED_PATH: stalled,
+        WORKBENCH_FIXTURE_CANCELLED_PATH: cancelled,
+        WORKBENCH_FIXTURE_CLOSED_PATH: closed,
+      },
+    },
+  });
+  const waitForFile = async (path) => {
+    const deadline = Date.now() + 2000;
+    while (true) {
+      try {
+        return await readFile(path, "utf8");
+      } catch (error) {
+        if (error.code !== "ENOENT" || Date.now() >= deadline) throw error;
+        await delay(10);
+      }
+    }
+  };
+  try {
+    await client.connect();
+    const controller = new AbortController();
+    const pending = client.callTool(
+      "stall_fixture",
+      {},
+      { signal: controller.signal },
+    );
+    const rejected = assert.rejects(pending, /caller cancelled|abort/i);
+    await waitForFile(stalled);
+    controller.abort(new Error("caller cancelled the selected request"));
+    await rejected;
+    const notification = JSON.parse(await waitForFile(cancelled));
+    assert.equal(typeof notification.requestId, "number");
+    assert.ok(!client.successfulTools.includes("stall_fixture"));
+    assert.equal(
+      (await client.session()).structuredContent.result.fixture.calls,
+      2,
+    );
+  } finally {
+    await client.close();
+  }
+  assert.equal(await readFile(closed, "utf8"), "closed\n");
+  assert.equal(client.state, "closed");
 });
 
 test("capability summary joins actual group names and preserves omitted/null/false and unlisted reports", () => {

@@ -1,0 +1,14 @@
+# Allow only runtime source and the exact dependency manifests into build context.
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!README.md
+!LICENSE
+!bin/
+!bin/**
+!lib/
+!lib/**
+!scripts/
+!scripts/container-entrypoint.sh

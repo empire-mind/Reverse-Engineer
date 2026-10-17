@@ -21,9 +21,9 @@ export async function saveErrorReceipt(memory, error) {
 }
 
 /** Validate only immutable, hash-bound bytes through the actual REA importer. */
-export async function validateStoredBundle(client, memory, imported) {
+export async function validateStoredBundle(client, memory, imported, options) {
   const path = memory.bundlePath(imported.bundleId);
-  await client.importBundle(path);
+  await client.importBundle(path, options);
   return memory.importBundle(path, {
     validatedByRea: true,
     expectedSha256: imported.bundleId.slice(7),
@@ -31,39 +31,81 @@ export async function validateStoredBundle(client, memory, imported) {
 }
 
 /** Export before the owning session closes; keep recovery files on any failure. */
-export async function retainSession(client, memory, { title, question } = {}) {
+export async function retainSession(
+  client,
+  memory,
+  { title, question, signal } = {},
+) {
+  signal?.throwIfAborted();
   const pending = await mkdtemp(join(memory.root, "pending-"));
   const destination = join(pending, "bundle.json");
-  let imported;
+  let pendingOwned = true;
+  let retained;
   try {
-    await client.exportBundle(destination);
-    imported = await memory.importBundle(destination, { title });
+    await client.exportBundle(destination, { signal });
+    const imported = await memory.importBundle(destination, { title });
+    // Canonical retention is established here, independently of later importer
+    // validation, optional notes, cancellation, or owned temporary-file cleanup.
+    retained = {
+      ...imported,
+      bundlePath: memory.bundlePath(imported.bundleId),
+      validation_error: null,
+      question_note: {
+        status: question ? "pending" : "not_requested",
+        recorded_evidence_ids: [],
+      },
+    };
     // Only this invocation owns the newly created pending directory.
     await rm(pending, { recursive: true });
-  } catch (error) {
-    error.pendingEvidencePath = destination;
+    pendingOwned = false;
+    signal?.throwIfAborted();
+    try {
+      const verified = await validateStoredBundle(client, memory, imported, {
+        signal,
+      });
+      retained.validation = verified.validation;
+    } catch (error) {
+      // Cancellation ends this workflow. A validation failure without
+      // cancellation remains a partial, explicitly unvalidated retention result.
+      if (signal?.aborted) throw error;
+      try {
+        await saveErrorReceipt(memory, error);
+      } catch (failure) {
+        error.retentionError = failure.message;
+      }
+      retained.validation_error = resultError(error);
+    }
+    signal?.throwIfAborted();
+    if (question) {
+      for (const id of imported.evidenceIds) {
+        signal?.throwIfAborted();
+        memory.note(id, `Investigation question: ${question}`);
+        retained.question_note.recorded_evidence_ids.push(id);
+      }
+      retained.question_note.status = "recorded";
+    }
+    signal?.throwIfAborted();
+    return retained;
+  } catch (failure) {
+    const error =
+      failure instanceof Error
+        ? failure
+        : new Error(String(failure), { cause: failure });
+    if (signal?.aborted) {
+      error.cancelled = true;
+      error.code ??= "WORKFLOW_CANCELLED";
+    }
+    if (retained) {
+      if (retained.question_note.status === "pending")
+        retained.question_note.status = retained.question_note
+          .recorded_evidence_ids.length
+          ? "partially_recorded"
+          : "not_recorded";
+      error.retained = retained;
+    }
+    if (pendingOwned) error.pendingEvidencePath = destination;
     throw error;
   }
-  let validationError = null;
-  try {
-    const verified = await validateStoredBundle(client, memory, imported);
-    imported.validation = verified.validation;
-  } catch (error) {
-    try {
-      await saveErrorReceipt(memory, error);
-    } catch (failure) {
-      error.retentionError = failure.message;
-    }
-    validationError = resultError(error);
-  }
-  if (question)
-    for (const id of imported.evidenceIds)
-      memory.note(id, `Investigation question: ${question}`);
-  return {
-    ...imported,
-    bundlePath: memory.bundlePath(imported.bundleId),
-    validation_error: validationError,
-  };
 }
 
 /** Summary views point to their authenticated analyzable parent in this bundle. */

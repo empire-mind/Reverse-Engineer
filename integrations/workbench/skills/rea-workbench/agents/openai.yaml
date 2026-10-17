@@ -1,0 +1,4 @@
+interface:
+  display_name: "REA Workbench"
+  short_description: "Investigate apps with durable, verifiable REA evidence"
+  default_prompt: "Use $rea-workbench to investigate this application, retain the evidence, and prepare a repeatable workflow."

@@ -11,6 +11,7 @@ import { createEvidence } from "rea-agents/dist/domain/evidence.js";
 import { createEvidenceBundle } from "rea-agents/dist/domain/evidenceBundle.js";
 import { createResidualUnknown } from "rea-agents/dist/domain/residualUnknown.js";
 import { InvestigationMemory } from "../lib/memory.mjs";
+import { WORKBENCH_VERSION } from "../lib/runtime.mjs";
 
 const entrypoint = fileURLToPath(
   new URL("../bin/memory-mcp.mjs", import.meta.url),
@@ -124,7 +125,7 @@ async function withMemoryServer(root, action) {
     await client.connect(transport, requestOptions);
     assert.deepEqual(client.getServerVersion(), {
       name: "rea-investigation-memory",
-      version: "0.1.0",
+      version: WORKBENCH_VERSION,
     });
     const catalog = await client.listTools(undefined, requestOptions);
     return await action(client, catalog);

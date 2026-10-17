@@ -152,3 +152,56 @@ test("resume follows only an authenticated parent; independent cleanup preserves
   );
   assert.equal(clientClosed, true);
 });
+
+test("aggregate projection preserves all wrapper recovery pointers as well as the actual primary and cleanup diagnoses", async () => {
+  const primary = Object.assign(new Error("Analysis interrupted"), {
+    code: "ANALYSIS_INTERRUPTED",
+  });
+  const cleanup = Object.assign(new Error("Owned SQLite close failed"), {
+    code: "SQLITE_IOERR",
+  });
+  let aggregate;
+  try {
+    await closeResources(
+      {
+        close() {
+          throw cleanup;
+        },
+      },
+      undefined,
+      primary,
+    );
+  } catch (error) {
+    aggregate = error;
+  }
+  const retained = {
+    bundleId: `sha256_${"a".repeat(64)}`,
+    bundlePath: "/private/memory/bundle.json",
+  };
+  Object.assign(aggregate, {
+    retained,
+    completedWorkflowStatus: "retained",
+    cancelled: true,
+    analysisReceipt: { path: "/private/memory/analysis-response.json" },
+    receipt: { path: "/private/memory/error-response.json" },
+    pendingEvidencePath: "/private/memory/pending/bundle.json",
+  });
+  const diagnostic = resultError(aggregate);
+  assert.equal(diagnostic.code, "ANALYSIS_INTERRUPTED");
+  assert.equal(diagnostic.cleanup_errors[0].code, "SQLITE_IOERR");
+  assert.equal(diagnostic.retained, retained);
+  assert.equal(diagnostic.completed_workflow_status, "retained");
+  assert.equal(diagnostic.cancelled, true);
+  assert.equal(
+    diagnostic.completed_analysis_receipt.path,
+    "/private/memory/analysis-response.json",
+  );
+  assert.equal(
+    diagnostic.diagnostic_receipt.path,
+    "/private/memory/error-response.json",
+  );
+  assert.equal(
+    diagnostic.pending_evidence_path,
+    "/private/memory/pending/bundle.json",
+  );
+});

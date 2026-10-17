@@ -1,0 +1,17 @@
+{
+  "verified_at": "2026-10-17",
+  "image": "docker.io/library/node:24.22.0-bookworm-slim",
+  "index_digest": "sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5",
+  "tag_last_updated": "2026-10-14T20:40:24.270759Z",
+  "metadata_source": "https://hub.docker.com/v2/repositories/library/node/tags/24.22.0-bookworm-slim",
+  "platforms": {
+    "linux/amd64": "sha256:ec857ea6bb60cb3d0fa4d97495590c5fe7d51be8572c307b55957eeb06569cf7",
+    "linux/arm64/v8": "sha256:156e9bc7a0a267cc6ca77b4283e32b123479342df684ce297455d7b95ff5a6b5"
+  },
+  "explicit_debian_packages": {
+    "procps": "2:4.0.2-3",
+    "libproc2-0": "2:4.0.2-3"
+  },
+  "debian_package_source": "https://packages.debian.org/bookworm/procps",
+  "reproducibility_boundary": "Base image index, Node version, npm dependency lock and the two explicit procps packages are pinned. Other required Debian dependencies resolve from signed bookworm repositories during the build; independently rebuilt final image digests are not promised to be identical."
+}

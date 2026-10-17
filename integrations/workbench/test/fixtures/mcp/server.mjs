@@ -5,6 +5,16 @@ import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 
 const mode = process.argv[2];
+if (mode === "startup-exit" || mode === "startup-exit-silent") {
+  if (mode === "startup-exit")
+    await new Promise((resolve) =>
+      process.stderr.write(
+        `${"x".repeat(70_000)}fixture startup failure tail\n`,
+        resolve,
+      ),
+    );
+  process.exit(23);
+}
 const sessionId = randomUUID();
 let records = [];
 let calls = 0;
@@ -79,7 +89,17 @@ if (mode === "stderr")
 const lines = createInterface({ input: process.stdin });
 for await (const line of lines) {
   const request = JSON.parse(line);
-  if (request.id === undefined) continue;
+  if (request.id === undefined) {
+    if (
+      request.method === "notifications/cancelled" &&
+      process.env.WORKBENCH_FIXTURE_CANCELLED_PATH
+    )
+      await writeFile(
+        process.env.WORKBENCH_FIXTURE_CANCELLED_PATH,
+        JSON.stringify(request.params),
+      );
+    continue;
+  }
   if (request.method === "initialize") {
     send(request.id, {
       protocolVersion: "2025-06-18",
@@ -178,6 +198,11 @@ for await (const line of lines) {
       });
       break;
     case "stall_fixture":
+      if (process.env.WORKBENCH_FIXTURE_STALLED_PATH)
+        await writeFile(
+          process.env.WORKBENCH_FIXTURE_STALLED_PATH,
+          "started\n",
+        );
       break;
     case "oversize_fixture":
       send(request.id, {

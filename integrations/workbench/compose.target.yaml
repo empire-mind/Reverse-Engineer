@@ -1,0 +1,10 @@
+# Opt in with -f compose.yaml -f compose.target.yaml for one selected artifact.
+services:
+  rea:
+    volumes:
+      - type: bind
+        source: ${REA_TARGET_DIR:?Set REA_TARGET_DIR to the absolute existing selected artifact path}
+        target: /targets
+        read_only: true
+        bind:
+          create_host_path: false
