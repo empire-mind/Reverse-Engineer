@@ -1,0 +1,27 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "rea-workbench",
+  "version": "0.2.0",
+  "description": "Investigate selected applications with REA, retain complete evidence, and resume across agent sessions.",
+  "author": { "name": "EmpireMind" },
+  "homepage": "https://github.com/empire-mind/Reverse-Engineer",
+  "repository": "https://github.com/empire-mind/Reverse-Engineer",
+  "license": "MIT",
+  "keywords": ["rea", "reverse-engineering", "evidence", "memory", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "interface": {
+        "displayName": "REA Workbench",
+        "shortDescription": "Investigate apps and retain verifiable evidence",
+        "developerName": "EmpireMind",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": [
+          "Use REA Workbench to investigate this application and retain the evidence.",
+          "Use REA Workbench to resume a saved investigation."
+        ]
+      }
+    }
+  }
+}

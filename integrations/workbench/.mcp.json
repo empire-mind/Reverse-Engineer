@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rea-workbench": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/workbench-mcp.mjs",
+        "--memory",
+        "${user_config.memory_directory}"
+      ]
+    }
+  }
+}

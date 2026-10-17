@@ -1,0 +1,20 @@
+{
+  "name": "rea-workbench",
+  "version": "0.2.0",
+  "description": "Evidence-preserving REA investigations with persistent local memory, CLI workflows, and one workflow MCP server.",
+  "author": {
+    "name": "EmpireMind",
+    "url": "https://github.com/empire-mind"
+  },
+  "repository": "https://github.com/empire-mind/Reverse-Engineer",
+  "license": "MIT",
+  "keywords": ["reverse-engineering", "rea", "evidence", "mcp", "memory"],
+  "userConfig": {
+    "memory_directory": {
+      "type": "directory",
+      "title": "Private REA memory directory",
+      "description": "An absolute directory outside this plugin and public Git content. Reuse the same local directory across clients for the same project.",
+      "required": true
+    }
+  }
+}
